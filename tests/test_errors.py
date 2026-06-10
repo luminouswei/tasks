@@ -21,6 +21,6 @@ def test_tool_execction_error_inherits_app_error():
 def test_code_to_status_mapping():
     assert CODE_TO_STATUS["TOOL_NOT_FOUND"] == 404
     assert CODE_TO_STATUS["TOOL_EXECUTION_ERROR"] == 400
-    assert CODE_TO_STATUS["TRACE_NOT_FOUND"] == 404
+    assert CODE_TO_STATUS["RUN_NOT_FOUND"] == 404
     assert CODE_TO_STATUS["INVALID_REQUEST"] == 422
     assert CODE_TO_STATUS["INTERNAL_ERROR"] == 500

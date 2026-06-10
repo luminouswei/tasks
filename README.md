@@ -1,22 +1,24 @@
 # Agent Tool Endpoint
 
-Minimal FastAPI backend for running registered tools and storing traces in SQLite.
+最小可用的 AI agent 工具调用后端:每次请求产生一条 `AgentRun`
+记录(包含 `status`、开始/结束时间戳、工具入参、错误信封),
+落 SQLite,支持列表与单条查询。
 
-## Setup
+## 安装
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-## Run
+## 启动
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-Server listens on `http://127.0.0.1:8000`. Interactive docs at `/docs`.
+服务监听 `http://127.0.0.1:8000`,交互式文档在 `/docs`。
 
-## Test
+## 测试
 
 ```bash
 pytest -q
@@ -24,9 +26,13 @@ pytest -q
 
 ## API
 
+所有响应**统一** 9 字段 `AgentRun` 形态。成功调用 `tool_result`
+有值、`error` 为 `null`;失败调用 `tool_result` 为 `null`、`error`
+是 `{code, message}` 对象。
+
 ### POST /agent/run
 
-Run a registered tool with a message.
+用消息 + 工具名调用一个已注册的工具。
 
 ```bash
 curl -X POST http://127.0.0.1:8000/agent/run \
@@ -34,48 +40,122 @@ curl -X POST http://127.0.0.1:8000/agent/run \
   -d '{"message": "12*8", "tool": "calculator"}'
 ```
 
-Success (200):
+成功(200):
+
 ```json
-{"trace_id": "...", "tool": "calculator", "result": 96.0, "latency_ms": 3}
+{
+  "run_id": "9f1c...",
+  "input": "12*8",
+  "selected_tool": "calculator",
+  "tool_args": {"message": "12*8"},
+  "status": "success",
+  "tool_result": 96,
+  "error": null,
+  "started_at": "2026-06-10T08:00:00.000Z",
+  "finished_at": "2026-06-10T08:00:00.005Z"
+}
 ```
 
-Dispatch-stage error (4xx/5xx from tool execution / routing):
+dispatch 阶段失败(4xx/5xx,工具执行 / 路由错误)—— 例:工具未注册(404):
+
 ```json
-{"trace_id": "...", "error": {"code": "TOOL_NOT_FOUND", "message": "tool 'weather' is not registered"}}
+{
+  "run_id": "a3b1...",
+  "input": "hi",
+  "selected_tool": "weather",
+  "tool_args": {"message": "hi"},
+  "status": "tool_not_found",
+  "tool_result": null,
+  "error": {"code": "TOOL_NOT_FOUND", "message": "tool 'weather' is not registered"},
+  "started_at": "...",
+  "finished_at": "..."
+}
 ```
 
-Validation-stage error (422 from request body validation, no trace generated):
+validation 阶段失败(422,请求体校验未通过,**不**生成 run):
+
 ```json
 {"error": {"code": "INVALID_REQUEST", "message": "body.message: Field required"}}
 ```
 
-| 阶段 | HTTP | error.code | trace_id |
-|---|---|---|---|
-| 参数缺失/不合规(validation) | 422 | `INVALID_REQUEST` | 无 |
-| tool 未注册(dispatch) | 404 | `TOOL_NOT_FOUND` | 有 |
-| 工具执行抛业务异常(dispatch) | 400 | `TOOL_EXECUTION_ERROR` | 有 |
-| 未预期异常(dispatch) | 500 | `INTERNAL_ERROR` | 有 |
+| 阶段 | HTTP | error.code | run_id | status |
+|---|---|---|---|---|
+| 参数缺失/不合规(validation) | 422 | `INVALID_REQUEST` | 无 | — |
+| tool 未注册(dispatch) | 404 | `TOOL_NOT_FOUND` | 有 | `tool_not_found` |
+| 工具执行抛业务异常(dispatch) | 400 | `TOOL_EXECUTION_ERROR` | 有 | `tool_error` |
+| 未预期异常(dispatch) | 500 | `INTERNAL_ERROR` | 有 | `internal_error` |
 
-> validation 阶段错误不触发工具调用、不写 trace,响应也不带 `trace_id`。只有进入 dispatch 阶段的请求才会生成 trace。
+> validation 阶段错误不触发工具调用、不写 run,响应也不带 `run_id`。其它三个 dispatch 阶段**全部**会落库成 run 记录,失败也能用 `run_id` 查到完整 trace。
 
-### GET /agent/traces/{trace_id}
+### GET /agent/runs/{run_id}
 
-Fetch a recorded trace by id.
+按 id 查一条 run。
 
 ```bash
-curl http://127.0.0.1:8000/agent/traces/<trace_id>
+curl http://127.0.0.1:8000/agent/runs/<run_id>
 ```
 
-Success (200) includes `input`, `result` (on success) or `error` (on failure), `latency_ms`, `created_at`. Not found returns 404 `TRACE_NOT_FOUND`.
+命中(200)返回完整 9 字段 `AgentRun`。未命中(404):
 
-## Built-in Tools
+```json
+{"error": {"code": "RUN_NOT_FOUND", "message": "run 'xxx' was not found"}}
+```
 
-- `echo` — returns the input message
-- `calculator` — evaluates `+ - * /` expressions with parentheses and unary minus (recursive-descent parser, no `eval`)
+### GET /agent/runs
 
-## Adding a New Tool
+列出所有 run,按 `started_at DESC` 排序,`run_id` 作为同毫秒 tiebreaker。
 
-1. Create `app/tools/<name>.py`:
+```bash
+# 默认:limit=50, offset=0
+curl http://127.0.0.1:8000/agent/runs
+
+# 翻页
+curl 'http://127.0.0.1:8000/agent/runs?limit=20&offset=40'
+```
+
+Query 参数:
+- `limit` — 1..200,默认 50
+- `offset` — >=0,默认 0
+
+越界值返回 422 `INVALID_REQUEST`(FastAPI `Query` 约束自动挡)。
+
+成功(200):
+
+```json
+{
+  "runs": [<AgentRun>, <AgentRun>, ...],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+### Debug recipe:一次失败调用的复盘
+
+```bash
+# 1. 触发一次调用(可能成功也可能失败),拿到 run_id
+curl -X POST http://127.0.0.1:8000/agent/run \
+  -H "Content-Type: application/json" \
+  -d '{"message": "1/0", "tool": "calculator"}'
+
+# 2. 用 run_id 查完整 trace
+curl http://127.0.0.1:8000/agent/runs/<run_id>
+
+# 3. 看最近 20 条调用
+curl 'http://127.0.0.1:8000/agent/runs?limit=20'
+```
+
+每条 run 都记录了:`input` / `selected_tool` / `tool_args` /
+`tool_result`(成功)或 `error`(失败) / `started_at` /
+`finished_at` —— 失败调用也能复盘。
+
+## 内置工具
+
+- `echo` — 原样返回输入的 message
+- `calculator` — 手写递归下降解析器,支持 `+ - * /`、括号、一元负号(无 `eval`)
+
+## 新增一个工具
+
+1. 创建 `app/tools/<name>.py`:
 
 ```python
 from app.registry import register_tool
@@ -85,14 +165,14 @@ def run(message: str) -> str:
     return f"sunny in {message}"
 ```
 
-2. Add one import line to `app/tools/__init__.py`:
+2. 在 `app/tools/__init__.py` 加一行 import:
 
 ```python
 from . import calculator, echo, weather
 ```
 
-No changes to `main.py` / `dispatcher.py` / `trace_store.py` are needed.
+不需要改 `main.py` / `dispatcher.py` / `agent_run_store.py`。
 
-## Configuration
+## 配置
 
-- `TRACE_DB_PATH` (env): SQLite file location, default `./traces.db`
+- `AGENT_RUN_DB_PATH`(env):SQLite 文件路径,默认 `./agent_runs.db`

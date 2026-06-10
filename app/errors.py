@@ -14,7 +14,7 @@ class ToolExecutionError(AppError):
 CODE_TO_STATUS = {
     "TOOL_NOT_FOUND": 404,
     "TOOL_EXECUTION_ERROR": 400,
-    "TRACE_NOT_FOUND": 404,
+    "RUN_NOT_FOUND": 404,
     "INVALID_REQUEST": 422,
     "INTERNAL_ERROR": 500,
 }
