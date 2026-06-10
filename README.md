@@ -87,6 +87,28 @@ validation 阶段失败(422,请求体校验未通过,**不**生成 run):
 
 > validation 阶段错误不触发工具调用、不写 run,响应也不带 `run_id`。其它三个 dispatch 阶段**全部**会落库成 run 记录,失败也能用 `run_id` 查到完整 trace。
 
+### POST /agent/runs/{run_id}/replay
+
+用历史 run 的入参(`tool_args["message"]`,fallback `input` + `selected_tool`)
+触发一次**新的**工具调用,产生**新** `run_id`,**原 run 一字不动**。
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent/runs/<run_id>/replay
+```
+
+返回形态跟 `POST /agent/run` 完全一致(成功 200,失败 4xx/5xx + error 信封),
+失败状态码映射也相同(`tool_not_found` → 404 / `tool_error` → 400 /
+`internal_error` → 500)。
+
+历史 run 不存在 → 404 `RUN_NOT_FOUND`。
+
+常用场景:
+- 复现一个生产失败的调用
+- 修了工具 bug 之后批量重跑所有 `tool_error` 的 run,看哪些变 success
+- 确认一个 `tool_not_found` 不是瞬时错误(重跑还是 tool_not_found = 真的没注册)
+
+> Replay 是"读历史 + 重新调度",**不修改**历史 run。这是"日志"和"动作"的边界:历史 run 是日志,replay 是动作。
+
 ### GET /agent/runs/{run_id}
 
 按 id 查一条 run。

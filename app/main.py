@@ -8,8 +8,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 import app.tools  # noqa: F401  # 触发工具自注册
+from app.agent_run import AgentRun
 from app.agent_run_store import get_run, init_db, list_runs
-from app.dispatcher import dispatch
+from app.dispatcher import DispatchResult, dispatch
 from app.errors import CODE_TO_STATUS
 from app.models import RunRequest
 
@@ -89,46 +90,84 @@ def _run_response_body(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
+    """AgentRun -> API 响应 dict(9 字段一致形态)。
+
+    成功时 tool_result 填值、error 为 None;失败时 tool_result 强制 None、
+    error 为 {code, message}。POST 和 replay 走这条路径,GET 走 _run_response_body。
+    """
+    body: dict[str, Any] = {
+        "run_id": run.run_id,
+        "input": run.input,
+        "selected_tool": run.selected_tool,
+        "tool_args": run.tool_args,
+        "status": run.status,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+    }
+    if run.error is not None:
+        body["error"] = {
+            "code": run.error.code,
+            "message": run.error.message,
+        }
+        body["tool_result"] = None
+    else:
+        body["error"] = None
+        body["tool_result"] = run.tool_result
+    return body
+
+
+def _dispatch_to_response(result: DispatchResult) -> dict[str, Any] | JSONResponse:
+    """把 DispatchResult 翻译成 HTTP 响应:成功返 200 dict,失败按 CODE_TO_STATUS 返 JSONResponse。
+
+    POST /agent/run 和 POST /agent/runs/{id}/replay 共用,保证两条路径响应形态完全一致。
+    """
+    run = result.run
+
+    if run.error is None:
+        return _agent_run_to_response_dict(run)
+
+    status_code = CODE_TO_STATUS.get(run.error.code, 500)
+    return JSONResponse(
+        status_code=status_code,
+        content=_agent_run_to_response_dict(run),
+    )
+
+
 # ---------- 路由 ----------
 
 
 @app.post("/agent/run")
 def run_agent(req: RunRequest):
-    result = dispatch(req.tool, req.message)
-    run = result.run
+    return _dispatch_to_response(dispatch(req.tool, req.message))
 
-    if run.error is None:
-        return _run_response_body({
-            "run_id": run.run_id,
-            "input": run.input,
-            "selected_tool": run.selected_tool,
-            "tool_args": run.tool_args,
-            "status": run.status,
-            "tool_result": run.tool_result,
-            "error": None,
-            "started_at": run.started_at,
-            "finished_at": run.finished_at,
-        })
 
-    status_code = CODE_TO_STATUS.get(run.error.code, 500)
-
+def _not_found_response(run_id: str) -> JSONResponse:
     return JSONResponse(
-        status_code=status_code,
-        content=_run_response_body({
-            "run_id": run.run_id,
-            "input": run.input,
-            "selected_tool": run.selected_tool,
-            "tool_args": run.tool_args,
-            "status": run.status,
-            "tool_result": None,
+        status_code=404,
+        content={
             "error": {
-                "code": run.error.code,
-                "message": run.error.message,
-            },
-            "started_at": run.started_at,
-            "finished_at": run.finished_at,
-        }),
+                "code": "RUN_NOT_FOUND",
+                "message": f"run '{run_id}' was not found",
+            }
+        },
     )
+
+
+@app.post("/agent/runs/{run_id}/replay")
+def replay_run(run_id: str):
+    original = get_run(run_id)
+    if original is None:
+        return _not_found_response(run_id)
+
+    # 优先用 tool_args["message"],fallback input
+    # tool_args 是 dict,可能为空;为空时直接用 input
+    tool_args = original["tool_args"] or {}
+    message = tool_args.get("message", original["input"])
+    selected_tool = original["selected_tool"]
+
+    # 重新 dispatch,产生新 run(新 run_id,新时间戳);原 run 一字不动
+    return _dispatch_to_response(dispatch(selected_tool, message))
 
 
 @app.get("/agent/runs")
@@ -151,12 +190,4 @@ def get_agent_run(run_id: str):
     if run is not None:
         return _run_response_body(run)
 
-    return JSONResponse(
-        status_code=404,
-        content={
-            "error": {
-                "code": "RUN_NOT_FOUND",
-                "message": f"run '{run_id}' was not found",
-            }
-        },
-    )
+    return _not_found_response(run_id)
