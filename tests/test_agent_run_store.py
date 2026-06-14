@@ -5,14 +5,19 @@ from app.agent_run_store import get_run, init_db, insert_run, list_runs
 
 
 def _base_record(**overrides) -> dict:
-    """默认构造一条 success run 的 record;用例通过 overrides 改字段。"""
+    """默认构造一条 completed run 的 record(新契约);用例通过 overrides 改字段。
+
+    新契约下:
+    - status 只用 completed / failed / trace_persist_failed(trace_persist_failed 不入 DB)
+    - 业务细节(原 success/tool_error/tool_not_found)全部走 error.code
+    """
     record = {
         "run_id": "a" * 32,
         "input": "12 * 8",
         "selected_tool": "calculator",
         "tool_args": {"message": "12 * 8"},
         "tool_result": 96,
-        "status": "success",
+        "status": "completed",
         "error_code": None,
         "error_message": None,
         "started_at": "2026-06-10T08:00:00+00:00",
@@ -22,7 +27,8 @@ def _base_record(**overrides) -> dict:
     return record
 
 
-def test_insert_and_get_success_run(tmp_path):
+def test_insert_and_get_completed_run(tmp_path):
+    """新契约:status=completed → 业务成功落库,error=None。"""
     db = tmp_path / "runs.db"
     init_db(db)
     record = _base_record()
@@ -35,11 +41,12 @@ def test_insert_and_get_success_run(tmp_path):
     assert loaded["input"] == "12 * 8"
     assert loaded["selected_tool"] == "calculator"
     assert loaded["tool_result"] == 96
-    assert loaded["status"] == "success"
+    assert loaded["status"] == "completed"
     assert loaded["error"] is None
 
 
-def test_insert_and_get_tool_error_run(tmp_path):
+def test_insert_and_get_failed_run_with_tool_input_error(tmp_path):
+    """新契约:status=failed + error.code=TOOL_INPUT_ERROR(用户输入错)。"""
     db = tmp_path / "runs.db"
     init_db(db)
     record = _base_record(
@@ -47,8 +54,8 @@ def test_insert_and_get_tool_error_run(tmp_path):
         input="1/0",
         tool_args={"message": "1/0"},
         tool_result=None,
-        status="tool_error",
-        error_code="TOOL_EXECUTION_ERROR",
+        status="failed",
+        error_code="TOOL_INPUT_ERROR",
         error_message="division by zero",
     )
     insert_run(record, db)
@@ -57,13 +64,36 @@ def test_insert_and_get_tool_error_run(tmp_path):
 
     assert loaded is not None
     assert loaded["tool_result"] is None
-    assert loaded["status"] == "tool_error"
+    assert loaded["status"] == "failed"
     assert loaded["error"] is not None
-    assert loaded["error"]["code"] == "TOOL_EXECUTION_ERROR"
+    assert loaded["error"]["code"] == "TOOL_INPUT_ERROR"
     assert loaded["error"]["message"] == "division by zero"
 
 
-def test_insert_and_get_tool_not_found_run(tmp_path):
+def test_insert_and_get_failed_run_with_tool_execution_error(tmp_path):
+    """新契约:status=failed + error.code=TOOL_EXECUTION_ERROR(工具内部崩)。"""
+    db = tmp_path / "runs.db"
+    init_db(db)
+    record = _base_record(
+        run_id="b" * 32,
+        input="x",
+        tool_args={"message": "x"},
+        tool_result=None,
+        status="failed",
+        error_code="TOOL_EXECUTION_ERROR",
+        error_message="weather API timeout",
+    )
+    insert_run(record, db)
+
+    loaded = get_run(record["run_id"], db)
+
+    assert loaded is not None
+    assert loaded["status"] == "failed"
+    assert loaded["error"]["code"] == "TOOL_EXECUTION_ERROR"
+
+
+def test_insert_and_get_failed_run_with_tool_not_found(tmp_path):
+    """新契约:status=failed + error.code=TOOL_NOT_FOUND(工具未注册)。"""
     db = tmp_path / "runs.db"
     init_db(db)
     record = _base_record(
@@ -72,7 +102,7 @@ def test_insert_and_get_tool_not_found_run(tmp_path):
         selected_tool="weather",
         tool_args={"message": "hi"},
         tool_result=None,
-        status="tool_not_found",
+        status="failed",
         error_code="TOOL_NOT_FOUND",
         error_message="tool 'weather' is not registered",
     )
@@ -81,8 +111,44 @@ def test_insert_and_get_tool_not_found_run(tmp_path):
     loaded = get_run(record["run_id"], db)
 
     assert loaded is not None
-    assert loaded["status"] == "tool_not_found"
+    assert loaded["status"] == "failed"
     assert loaded["error"]["code"] == "TOOL_NOT_FOUND"
+
+
+# ---------- 兼容:老 status 字面量 passthrough 直到迁移 ----------
+
+def test_legacy_status_values_are_passthrough_until_migration(tmp_path):
+    """老 DB 里的旧 status 值新代码不认,store 层只是透传(不做映射、不抛错)。
+
+    迁移期间:
+    - 新代码 dispatch 不会再产生旧值
+    - 但读老 DB 时还会原样读出来,直到迁库完成为止
+    - 这是有意为之:不让 store 层做"读时改写"这种暗箱逻辑
+
+    客户端:
+    - 拿到老值时按"未知 status"处理(不要写死 if-elif 判断)
+    - 跟新值混存期间,分桶查询(比如 'status = "failed"')会漏掉老值
+    - **建议迁移时先清库**,不要靠运行时翻译
+    """
+    db = tmp_path / "runs.db"
+    init_db(db)
+
+    legacy_values = ["success", "tool_not_found", "tool_error", "internal_error"]
+    for i, legacy_status in enumerate(legacy_values):
+        insert_run(_base_record(
+            run_id=str(i).zfill(32),
+            status=legacy_status,
+            tool_result=None if legacy_status != "success" else 96,
+        ), db)
+
+    # 全部按原值读出来,store 不做映射
+    for i, legacy_status in enumerate(legacy_values):
+        loaded = get_run(str(i).zfill(32), db)
+        assert loaded is not None
+        assert loaded["status"] == legacy_status, (
+            f"store 不应该翻译老 status 值,实际返 {loaded['status']!r} "
+            f"(写入 {legacy_status!r})"
+        )
 
 
 def test_tool_args_round_trip_is_decoded_dict(tmp_path):

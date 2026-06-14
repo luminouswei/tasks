@@ -245,8 +245,10 @@ def test_legacy_traces_endpoint_404(client):
 
 def test_run_endpoint_returns_500_when_trace_persist_fails(client, monkeypatch):
     """dispatcher.insert_run 抛异常 → POST /agent/run 返 500,
-    响应体仍 10 字段,error.code = TRACE_PERSIST_FAILED,
-    业务结果(completed + tool_result)被覆盖成 None(因为 trace 没拿到)。
+    响应体仍 10 字段,error.code = TRACE_PERSIST_FAILED。
+    **业务结果保留**:echo 返回 "hi",响应里 tool_result 也是 "hi"——
+    业务执行过了,trace 没记下来,但调用方应该拿到业务结果(否则工具
+    被调一次结果还丢了,代价太大)。
     """
     def broken_insert_run(record, path=None):
         raise RuntimeError("disk full: simulated")
@@ -264,12 +266,12 @@ def test_run_endpoint_returns_500_when_trace_persist_fails(client, monkeypatch):
     for key in ALL_AGENT_RUN_KEYS:
         assert key in body, f"missing key: {key}"
 
-    # 业务执行成功了,所以 status=trace_persist_failed(盖在 completed 上);trace 没记下来
+    # status 盖成 trace_persist_failed
     assert body["status"] == "trace_persist_failed"
     # error.code 显式带出失败原因
     assert body["error"]["code"] == "TRACE_PERSIST_FAILED"
     assert "disk full" in body["error"]["message"]
-    # tool_result 强制 None(trace 没记,客户端拿到也不能信)
-    assert body["tool_result"] is None
+    # **tool_result 保留业务结果**:echo 返回 "hi",调用方拿得到
+    assert body["tool_result"] == "hi"
     # run_id 仍然返回,主调用方可以拿这个 ID 去后台排查
     assert re.fullmatch(r"[0-9a-f]{32}", body["run_id"])

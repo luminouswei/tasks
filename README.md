@@ -175,13 +175,15 @@ trace 持久化失败(500,业务已执行完但 trace 没落库)—— 这种 ru
   "selected_tool": "echo",
   "tool_args": {"message": "hi"},
   "status": "trace_persist_failed",
-  "tool_result": null,
+  "tool_result": "hi",
   "error": {"code": "TRACE_PERSIST_FAILED", "message": "RuntimeError: disk full"},
   "warnings": [],
   "started_at": "...",
   "finished_at": "..."
 }
 ```
+
+> **关键契约**:`TRACE_PERSIST_FAILED` 时 `tool_result` **保留业务结果**(业务执行过了,工具被调一次,结果不能丢)。客户端靠 `error.code` 区分"业务失败"和"业务成功但 trace 没记",**绝对不要**把这种响应当成业务失败重发请求(否则工具会被调两次)。
 
 工具跑通但 result 不可 JSON 序列化(200,带 warning 降级):
 
