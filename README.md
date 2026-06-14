@@ -84,8 +84,26 @@ validation 阶段失败(422,请求体校验未通过,**不**生成 run):
 | tool 未注册(dispatch) | 404 | `TOOL_NOT_FOUND` | 有 | `tool_not_found` |
 | 工具执行抛业务异常(dispatch) | 400 | `TOOL_EXECUTION_ERROR` | 有 | `tool_error` |
 | 未预期异常(dispatch) | 500 | `INTERNAL_ERROR` | 有 | `internal_error` |
+| 业务已执行但 trace 落库失败 | 500 | `TRACE_PERSIST_FAILED` | 有 | 业务 status(可能 `success` / `tool_error` / `internal_error`) |
 
-> validation 阶段错误不触发工具调用、不写 run,响应也不带 `run_id`。其它三个 dispatch 阶段**全部**会落库成 run 记录,失败也能用 `run_id` 查到完整 trace。
+### 工具结果序列化 fallback
+
+当 `tool_result` 或 `tool_args` 包含无法被 `json.dumps` 直接序列化的值
+(`set` / `bytes` / `Decimal` / 自定义对象 / 任何带 `__repr__` 但不是标准 JSON
+类型的对象),trace **不会**丢,只是把那个字段整体替换为:
+
+```json
+{
+  "_unserializable": true,
+  "type": "<原值类型名>",
+  "repr": "<repr(...) 截断到 500 字符>"
+}
+```
+
+`GET /agent/runs/{run_id}` 读出来 `tool_result` 就是这个 dict。客户端
+可以靠 `_unserializable: true` 这个 marker 识别并做"原始结果不可用"
+的友好展示,而不是误以为工具没返回。**整条 trace 一定落库**,只是
+单个字段可能降级。
 
 ### POST /agent/runs/{run_id}/replay
 

@@ -171,3 +171,64 @@ def test_dispatch_tool_not_found_persists_to_store(temp_agent_run_db):
     assert loaded["status"] == "tool_not_found"
     assert loaded["error"]["code"] == "TOOL_NOT_FOUND"
     assert loaded["tool_result"] is None
+
+
+# ---------- 4. 不可序列化 tool_result 仍能落库 ----------
+
+
+def test_dispatch_unserializable_tool_result_still_persists(temp_agent_run_db):
+    """工具返回 set/自定义对象等不可 JSON 序列化的值,trace 仍要落库,
+    并且读出来的 tool_result 是结构化 fallback(带 _unserializable 标记)。
+    关键:不再静默退化为 None。
+    """
+    def fake_run(message: str):
+        return {1, 2, 3}  # set
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    # 业务结果(status=success)不受影响
+    assert result.run.status == "success"
+    # AgentRun 内存里的 tool_result 仍然是原始 set(主调用方拿得到)
+    assert result.run.tool_result == {1, 2, 3}
+
+    # trace 仍然落库
+    loaded = get_run(result.run.run_id, temp_agent_run_db)
+    assert loaded is not None
+    assert loaded["status"] == "success"
+    # 落库后是结构化 fallback dict,不是 None
+    assert loaded["tool_result"] is not None
+    assert loaded["tool_result"]["_unserializable"] is True
+    assert loaded["tool_result"]["type"] == "set"
+
+
+# ---------- 5. 持久化失败时,调用方能拿到明确失败信息 ----------
+
+
+def test_dispatch_surfaces_persistence_failure(monkeypatch, tmp_path):
+    """insert_run 抛异常(模拟 DB 锁 / 磁盘满 / 权限错),
+    dispatch 不应再静默吞错,要在 run 上带出 trace_persistence=failed + trace_error。"""
+    db = tmp_path / "runs.db"
+    init_db(db)
+    monkeypatch.setattr("app.agent_run_store._db_path", db)
+
+    def broken_insert_run(record, path=None):
+        raise RuntimeError("disk full: simulated")
+    monkeypatch.setattr("app.dispatcher.insert_run", broken_insert_run)
+
+    def fake_run(message: str):
+        return {"ok": True}
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    # 业务结果仍然返回,不让 trace 失败反过来影响业务可观察性
+    assert result.run.status == "success"
+    assert result.run.tool_result == {"ok": True}
+    # 持久化失败被显式带出来
+    assert result.run.trace_persistence == "failed"
+    assert result.run.trace_error is not None
+    assert "RuntimeError" in result.run.trace_error
+    assert "disk full" in result.run.trace_error
+    # 业务 error 字段不该被污染(这是 trace 失败,不是业务失败)
+    assert result.run.error is None
