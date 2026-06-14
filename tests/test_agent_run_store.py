@@ -195,3 +195,103 @@ def test_list_runs_empty(tmp_path):
     runs = list_runs(path=db)
 
     assert runs == []
+
+
+# ---------- safe_serialize_tool_result + 不可序列化路径 ----------
+
+
+def test_safe_serialize_preserves_json_values():
+    """正常 JSON 值:dict / list / str / int 透传,不影响内容。"""
+    import json
+
+    from app.agent_run_store import safe_serialize_tool_result
+
+    assert json.loads(safe_serialize_tool_result({"a": 1, "b": [1, 2]})) == {"a": 1, "b": [1, 2]}
+    assert json.loads(safe_serialize_tool_result([1, "x", None])) == [1, "x", None]
+    assert json.loads(safe_serialize_tool_result(42)) == 42
+    assert json.loads(safe_serialize_tool_result("hello")) == "hello"
+
+
+def test_safe_serialize_handles_unserializable_values():
+    """不可 JSON 序列化的值(set / bytes / 自定义对象)退化成结构化标记,
+    保留 type 名 + 截断 repr,方便调试。绝不抛异常。"""
+    import json
+
+    from app.agent_run_store import safe_serialize_tool_result
+
+    fallback_set = json.loads(safe_serialize_tool_result({1, 2, 3}))
+    assert fallback_set["_unserializable"] is True
+    assert fallback_set["type"] == "set"
+
+    fallback_bytes = json.loads(safe_serialize_tool_result(b"binary"))
+    assert fallback_bytes["_unserializable"] is True
+    assert fallback_bytes["type"] == "bytes"
+    assert "binary" in fallback_bytes["repr"]
+
+    class Secret:
+        def __repr__(self) -> str:
+            return "<Secret: leaked-detail>"
+
+    fallback_obj = json.loads(safe_serialize_tool_result(Secret()))
+    assert fallback_obj["_unserializable"] is True
+    assert fallback_obj["type"] == "Secret"
+    assert "<Secret" in fallback_obj["repr"]
+
+
+def test_safe_serialize_truncates_oversized_repr():
+    """极长的 repr 也要截断,避免单条 trace 把 DB 撑爆。"""
+    import json
+
+    from app.agent_run_store import safe_serialize_tool_result
+
+    class Chatty:
+        def __repr__(self) -> str:
+            return "x" * 5000
+
+    fallback = json.loads(safe_serialize_tool_result(Chatty()))
+    assert fallback["_unserializable"] is True
+    assert len(fallback["repr"]) == 500  # 截断上限
+
+
+def test_unserializable_tool_result_round_trips_through_store(tmp_path):
+    """集成:tool_result 不可序列化 → 落库后 GET 出来仍是 fallback dict,不是 None。"""
+    db = tmp_path / "runs.db"
+    init_db(db)
+    record = _base_record(
+        run_id="d" * 32,
+        tool_result={1, 2, 3},  # set 不可 JSON 化
+    )
+    insert_run(record, db)
+
+    loaded = get_run(record["run_id"], db)
+
+    assert loaded is not None
+    # 关键:不再静默退化为 None,而是带 _unserializable 标记的 dict
+    assert loaded["tool_result"] is not None
+    assert loaded["tool_result"]["_unserializable"] is True
+    assert loaded["tool_result"]["type"] == "set"
+
+
+def test_unserializable_tool_args_round_trips_through_store(tmp_path):
+    """tool_args 也不应该有隐藏炸弹:不可 JSON 化也要走 fallback,不能整条 trace 丢。
+
+    fallback 粒度:整个 tool_args 一起走(json.dumps 是整体调用,任一嵌套不可序列化
+    就触发),不是按 key 递归。这是有意为之——保持 helper 简单、行为可预测。
+    """
+    db = tmp_path / "runs.db"
+    init_db(db)
+    record = _base_record(
+        run_id="e" * 32,
+        tool_args={"message": "x", "extra": {1, 2}},  # 嵌套 set
+    )
+    insert_run(record, db)
+
+    loaded = get_run(record["run_id"], db)
+
+    # 关键:整条 trace 落库成功,没因为 tool_args 里有 set 而整条丢
+    assert loaded is not None
+    # 整个 tool_args 走 fallback
+    assert loaded["tool_args"]["_unserializable"] is True
+    assert loaded["tool_args"]["type"] == "dict"
+    # repr 里能看到原 dict 的关键信息(用于调试)
+    assert "message" in loaded["tool_args"]["repr"]

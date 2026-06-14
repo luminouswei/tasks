@@ -93,8 +93,10 @@ def _run_response_body(run: dict[str, Any]) -> dict[str, Any]:
 def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
     """AgentRun -> API 响应 dict(9 字段一致形态)。
 
-    成功时 tool_result 填值、error 为 None;失败时 tool_result 强制 None、
-    error 为 {code, message}。POST 和 replay 走这条路径,GET 走 _run_response_body。
+    成功时 tool_result 填值、error 为 None;业务失败时 tool_result 强制 None、
+    error 为 {code, message};trace 持久化失败时用 TRACE_PERSIST_FAILED
+    覆盖 error 字段(优先级高于业务 error,告诉调用方"业务结果拿到了但没记下来")。
+    POST 和 replay 走这条路径,GET 走 _run_response_body。
     """
     body: dict[str, Any] = {
         "run_id": run.run_id,
@@ -105,7 +107,13 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
         "started_at": run.started_at,
         "finished_at": run.finished_at,
     }
-    if run.error is not None:
+    if run.trace_persistence == "failed":
+        body["error"] = {
+            "code": "TRACE_PERSIST_FAILED",
+            "message": run.trace_error or "trace persistence failed",
+        }
+        body["tool_result"] = None
+    elif run.error is not None:
         body["error"] = {
             "code": run.error.code,
             "message": run.error.message,
@@ -118,11 +126,21 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
 
 
 def _dispatch_to_response(result: DispatchResult) -> dict[str, Any] | JSONResponse:
-    """把 DispatchResult 翻译成 HTTP 响应:成功返 200 dict,失败按 CODE_TO_STATUS 返 JSONResponse。
+    """把 DispatchResult 翻译成 HTTP 响应。
+
+    - trace 持久化失败 -> 500(优先级最高,业务结果虽然拿到了但需要可观测性告警)
+    - 业务成功 -> 200 dict
+    - 业务失败 -> 按 CODE_TO_STATUS 返 4xx/5xx JSONResponse
 
     POST /agent/run 和 POST /agent/runs/{id}/replay 共用,保证两条路径响应形态完全一致。
     """
     run = result.run
+
+    if run.trace_persistence == "failed":
+        return JSONResponse(
+            status_code=500,
+            content=_agent_run_to_response_dict(run),
+        )
 
     if run.error is None:
         return _agent_run_to_response_dict(run)

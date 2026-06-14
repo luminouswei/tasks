@@ -27,3 +27,8 @@ class AgentRun:
     error: AgentErrorPayload | None
     started_at: str
     finished_at: str
+    # trace_persistence 描述"业务执行成功后,trace 是否成功落库"。
+    # "ok" = insert_run 成功;"failed" = 抛了异常(dispatcher 仍把业务结果带回来,主调用方拿得到)。
+    # 跟 status 字段正交:status 描述业务结果(成功/失败),trace_persistence 描述可观测性落库结果。
+    trace_persistence: Literal["ok", "failed"] = "ok"
+    trace_error: str | None = None

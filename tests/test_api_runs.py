@@ -202,3 +202,42 @@ def test_legacy_traces_endpoint_404(client):
 
     # 路由不存在,FastAPI 默认 404
     assert response.status_code == 404
+
+
+# ---------- trace 持久化失败 → 500 TRACE_PERSIST_FAILED ----------
+
+
+def test_run_endpoint_returns_500_when_trace_persist_fails(client, monkeypatch):
+    """dispatcher.insert_run 抛异常 → POST /agent/run 返 500,
+    响应体仍 9 字段,error.code = TRACE_PERSIST_FAILED,
+    业务结果(success + tool_result)被覆盖成 None(因为 trace 没拿到)。
+    """
+    def broken_insert_run(record, path=None):
+        raise RuntimeError("disk full: simulated")
+    monkeypatch.setattr("app.dispatcher.insert_run", broken_insert_run)
+
+    response = client.post(
+        "/agent/run",
+        json={"message": "hi", "tool": "echo"},
+    )
+
+    assert response.status_code == 500
+    body = response.json()
+
+    # 9 字段都在(契约不破)
+    for key in (
+        "run_id", "input", "selected_tool", "tool_args",
+        "tool_result", "status", "error",
+        "started_at", "finished_at",
+    ):
+        assert key in body
+
+    # 业务执行成功了,所以 status=success;但 trace 没记下来
+    assert body["status"] == "success"
+    # error.code 显式带出失败原因,跟现有 4 类业务错误平级
+    assert body["error"]["code"] == "TRACE_PERSIST_FAILED"
+    assert "disk full" in body["error"]["message"]
+    # tool_result 强制 None(trace 没记,客户端拿到也不能信)
+    assert body["tool_result"] is None
+    # run_id 仍然返回,主调用方可以拿这个 ID 去后台排查
+    assert re.fullmatch(r"[0-9a-f]{32}", body["run_id"])
