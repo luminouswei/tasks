@@ -26,6 +26,37 @@ uvicorn app.main:app --reload
 pytest -q
 ```
 
+### 回归评测套件（agent diagnostics）
+
+跨层不变量回归测试,盯"dispatch → store → diagnostics(纯函数) → API(HTTP response shaping)"一条龙的关键行为不被悄悄破坏。
+
+```bash
+pytest -q tests/test_agent_diagnostics_regression.py
+```
+
+跑出来 5 条主用例 + 1 条自检,每条会打印一行 `case_name / failure_type / ...` 的报告。
+
+**保护的不变量**:
+
+| 用例 | 盯住的行为 |
+| --- | --- |
+| `case_1 happy path` | 成功 run 的 7 事件时间线顺序固定 + 落库完整 + `build_diagnostics` 翻译一致 |
+| `case_2 tool execution failure` | `ToolExecutionError` → `failure_type=tool_error` + 失败原因不脱敏 + timeline 用 `tool_failed` |
+| `case_3 unserializable tool result` | set/bytes 等 JSON 不可序列化值走 fallback + `failure_type=serialization_error` + 不丢业务结果 |
+| `case_4 persistence failure boundary` | `insert_run` 抛异常时业务结果保留 + status=`trace_persist_failed` + DB 里查不到这条但 diagnostics 仍能查 |
+| `case_5 api smoke via http` | 走 `POST /agent/run` + `GET /agent/runs/{id}/diagnostics`,验证 7 字段契约在 HTTP response shaping 后不破 + 404 走 `RUN_NOT_FOUND` |
+| `SUCCESS_TIMELINE constant` | 7 事件顺序常量跟 dispatcher 实际产出对齐;常量改了但 dispatcher 没改这条会先红 |
+
+**如果这条红了,排查顺序**:
+
+1. **红色用例的事件名断言失败** → 先看 `SUCCESS_TIMELINE` 常量跟 `app/agent_run.py` docstring + `app/diagnostics.py` 头注释里列的事件名是否还一致;同步常量后再看 dispatcher。
+2. **红色用例的 `failure_type` 断言失败** → 看 `app/diagnostics.py` 的 `_ERROR_CODE_TO_FAILURE_TYPE` / `_WARNING_CODE_TO_FAILURE_TYPE` 闭集是否被改;改了表但忘了同步 `SUGGESTED_ACTIONS` / `build_diagnostic_summary` 也是常见 bug 来源。
+3. **红色用例的持久化断言失败** → 看 `app/agent_run_store.py` 的 `safe_serialize_tool_result` / `_row_to_dict`;序列化 fallback 路径改了最容易破这条。
+4. **红色用例的 diagnostics 翻译断言失败** → 看 `app/diagnostics.py::build_diagnostics`,特别是 timeline 转 dict 那段和 `_safe_error_message` 的脱敏逻辑。
+5. **case_5(API smoke)红了** → 看 `app/main.py` 的 `_diagnostics_to_response` / `_dispatch_to_response` / `_not_found_response`;HTTP response shaping 改了字段名或嵌套结构最容易破这条。
+
+跟单点 unit test(`test_dispatcher.py` / `test_api_diagnostics.py` 等)的关系: 单点测盯"这一层契约",回归套件盯"跨层一致";前者红说明某层坏了,后者红说明某层改了但其它层没跟上。
+
 ## API
 
 所有响应**统一** 10 字段 `AgentRun` 形态:
