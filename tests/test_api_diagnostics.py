@@ -222,3 +222,153 @@ def test_diagnostics_persistence_failure_run_not_queryable(client, monkeypatch):
     response = client.get(f"/agent/runs/{run_id}/diagnostics")
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "RUN_NOT_FOUND"
+
+
+# ---------- POST 响应附带 diagnostics:让 persistence_error 真的能被客户端看到 ----------
+
+
+def test_post_response_attaches_diagnostics_on_trace_persist_failed(client, monkeypatch):
+    """trace 落库失败时 POST 响应里**直接带** `diagnostics` 字段。
+
+    这是唯一能让客户端看到 failure_type=persistence_error 的路径——
+    DB 里没这行,GET diagnostics 返 404。POST 响应里附一份完整的
+    diagnostics 视图,客户端拿一次响应就能定位失败阶段、看到 suggested_action。
+    """
+    def broken_insert_run(record, path=None):
+        raise RuntimeError("disk full: simulated")
+    monkeypatch.setattr("app.dispatcher.insert_run", broken_insert_run)
+
+    post = client.post(
+        "/agent/run",
+        json={"message": "hi", "tool": "echo"},
+    )
+    assert post.status_code == 500
+    body = post.json()
+
+    # 10 字段契约不破(原行为保持)
+    for key in ("run_id", "input", "selected_tool", "tool_args",
+                "status", "tool_result", "error", "warnings",
+                "started_at", "finished_at"):
+        assert key in body, f"missing key: {key}"
+
+    # 关键:响应里**额外**有 diagnostics 字段,且 failure_type=persistence_error
+    assert "diagnostics" in body
+    diag = body["diagnostics"]
+    assert diag["run_id"] == body["run_id"]
+    assert diag["status"] == "trace_persist_failed"
+    assert diag["failure_type"] == "persistence_error"
+    assert diag["suggested_action"] == "inspect persistence backend and retry trace insert"
+    # timeline 包含 trace_persist_failed 事件
+    event_names = [ev["name"] for ev in diag["timeline"]]
+    assert "trace_persist_failed" in event_names
+    assert "response_returned" in event_names
+    # 业务结果保留(原契约)
+    assert body["tool_result"] == "hi"
+
+
+def test_post_response_attaches_diagnostics_on_business_failure(client, monkeypatch):
+    """业务失败(非 trace_persist_failed)的 POST 响应也带 diagnostics。
+
+    业务失败后客户端拿一次响应就能看 failure_type / timeline / suggested_action,
+    不必 round-trip 一次 GET diagnostics。
+    """
+    from app import registry
+    from app.registry import ToolSpec
+    from app.errors import ToolExecutionError
+
+    def boom(message: str):
+        raise ToolExecutionError("weather API timed out")
+    registry._registry["fake_boom"] = ToolSpec(
+        name="fake_boom", description="boom", run=boom,
+    )
+
+    try:
+        post = client.post(
+            "/agent/run",
+            json={"message": "hi", "tool": "fake_boom"},
+        )
+        # 业务失败 + tool 责任 → 500
+        assert post.status_code == 500
+        body = post.json()
+
+        # 10 字段契约
+        for key in ("run_id", "input", "selected_tool", "tool_args",
+                    "status", "tool_result", "error", "warnings",
+                    "started_at", "finished_at"):
+            assert key in body, f"missing key: {key}"
+
+        # 关键:也带了 diagnostics
+        assert "diagnostics" in body
+        diag = body["diagnostics"]
+        assert diag["failure_type"] == "tool_error"
+        assert diag["failure_message"] == "weather API timed out"
+        assert diag["suggested_action"] == "inspect tool health and recent tool logs"
+        # timeline 走 tool_failed 分支
+        event_names = [ev["name"] for ev in diag["timeline"]]
+        assert "tool_failed" in event_names
+        assert "tool_executed" not in event_names
+    finally:
+        registry._registry.pop("fake_boom", None)
+
+
+def test_post_response_does_not_attach_diagnostics_on_success(client):
+    """成功 run 的 POST 响应**不**带 diagnostics(成功不需要调试视图,
+    保持 10 字段简洁形态;客户端要 diagnostics 走 GET endpoint)。"""
+    post = client.post(
+        "/agent/run",
+        json={"message": "hi", "tool": "echo"},
+    )
+    assert post.status_code == 200
+    body = post.json()
+    assert "diagnostics" not in body
+
+
+# ---------- API 层 end-to-end tool_error 测试(补齐 dispatcher 单元测试的覆盖) ----------
+
+
+def test_diagnostics_tool_execution_error_via_api_layer(client, monkeypatch):
+    """API 层验证 tool_execution_error 端到端:monkeypatch 一个工具抛 ToolExecutionError,
+    POST 响应和 GET diagnostics 都正确分类为 tool_error。
+
+    跟现有 test_diagnostics_tool_execution_error_classified_as_tool_error 的区别:
+    那个用的是 calculator '1 + a'(非数字 → TOOL_INPUT_ERROR → validation_error),
+    没有真正测 tool_error 路径。这里是 dispatcher 单测已经覆盖过的 ToolExecutionError
+    的端到端版本,确认 API 层的分类契约不漂。
+    """
+    from app import registry
+    from app.registry import ToolSpec
+    from app.errors import ToolExecutionError
+
+    def boom(message: str):
+        raise ToolExecutionError("downstream API timed out")
+    registry._registry["fake_tool_err"] = ToolSpec(
+        name="fake_tool_err", description="boom", run=boom,
+    )
+
+    try:
+        # 1. POST → 500 + error.code=TOOL_EXECUTION_ERROR + diagnostics.failure_type=tool_error
+        post = client.post(
+            "/agent/run",
+            json={"message": "hi", "tool": "fake_tool_err"},
+        )
+        assert post.status_code == 500
+        post_body = post.json()
+        assert post_body["status"] == "failed"
+        assert post_body["error"]["code"] == "TOOL_EXECUTION_ERROR"
+        assert post_body["error"]["message"] == "downstream API timed out"
+        assert post_body["diagnostics"]["failure_type"] == "tool_error"
+
+        # 2. GET diagnostics 也确认 tool_error
+        run_id = post_body["run_id"]
+        get_resp = client.get(f"/agent/runs/{run_id}/diagnostics")
+        assert get_resp.status_code == 200
+        get_body = get_resp.json()
+        assert get_body["failure_type"] == "tool_error"
+        assert get_body["failure_message"] == "downstream API timed out"
+        assert get_body["suggested_action"] == "inspect tool health and recent tool logs"
+        # tool_failed 事件被记到 timeline(失败分支也保留)
+        event_names = [ev["name"] for ev in get_body["timeline"]]
+        assert "tool_failed" in event_names
+        assert "tool_executed" not in event_names
+    finally:
+        registry._registry.pop("fake_tool_err", None)

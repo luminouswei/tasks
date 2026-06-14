@@ -137,27 +137,39 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
 def _dispatch_to_response(result: DispatchResult) -> dict[str, Any] | JSONResponse:
     """把 DispatchResult 翻译成 HTTP 响应。
 
-    - status == "trace_persist_failed" -> 500(trace 落库失败,但业务结果已拿到)
-    - 业务成功(status == "completed") -> 200
-    - 业务失败(status == "failed" + error 有值) -> 按 CODE_TO_STATUS 返 4xx/5xx
+    - status == "trace_persist_failed" -> 500 + 响应里**额外**带 `diagnostics` 字段
+      (因为这种 run DB 里没有,GET /agent/runs/{id}/diagnostics 查不到;
+       唯一能让调用方看到 failure_type=persistence_error 完整结构的路径
+       就是在 POST 响应里直接给)
+    - 业务成功(status == "completed") -> 200,无 diagnostics 字段(成功不需要调试视图)
+    - 业务失败(status == "failed" + error 有值) -> 按 CODE_TO_STATUS 返 4xx/5xx,
+      也带 diagnostics 字段(失败就该有调试视图)
 
     POST /agent/run 和 POST /agent/runs/{id}/replay 共用,保证两条路径响应形态完全一致。
     """
     run = result.run
 
     if run.status == "trace_persist_failed":
+        body = _agent_run_to_response_dict(run)
+        # trace_persist_failed 是唯一需要"现场就给出 diagnostics"的场景:
+        # DB 没这一行,GET endpoint 查不到。其它情况下 diagnostics 可以走 GET。
+        body["diagnostics"] = _diagnostics_to_response(build_diagnostics(run))
         return JSONResponse(
             status_code=CODE_TO_STATUS.get("TRACE_PERSIST_FAILED", 500),
-            content=_agent_run_to_response_dict(run),
+            content=body,
         )
 
     if run.error is None:
         return _agent_run_to_response_dict(run)
 
+    body = _agent_run_to_response_dict(run)
+    # 业务失败也带 diagnostics(failure_type / timeline / suggested_action 一并给),
+    # 客户端拿一次响应就能定位失败阶段,不必再 round-trip 一次 GET。
+    body["diagnostics"] = _diagnostics_to_response(build_diagnostics(run))
     status_code = CODE_TO_STATUS.get(run.error.code, 500)
     return JSONResponse(
         status_code=status_code,
-        content=_agent_run_to_response_dict(run),
+        content=body,
     )
 
 
