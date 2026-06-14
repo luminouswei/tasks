@@ -13,6 +13,29 @@ def _resolve_path(path: str | Path | None = None) -> Path:
     return Path(path)
 
 
+_UNSERIALIZABLE_REPR_LIMIT = 500
+
+
+def safe_serialize_tool_result(value: Any) -> str:
+    """把 tool_result / tool_args 转成可 JSON 序列化的字符串。
+
+    正常值走 json.dumps 透传;不可序列化的值退化成结构化标记:
+    {"_unserializable": True, "type": "<类名>", "repr": "<截断到 500 字符>"}。
+    绝不抛异常,保证 trace 持久化路径不会因为单个字段而整条丢失。
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return json.dumps(
+            {
+                "_unserializable": True,
+                "type": type(value).__name__,
+                "repr": repr(value)[:_UNSERIALIZABLE_REPR_LIMIT],
+            },
+            ensure_ascii=False,
+        )
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """把 sqlite Row 还原成跟 AgentRun 字段一一对应的 dict。
 
@@ -76,16 +99,12 @@ def init_db(path: str | Path | None = None) -> None:
 def insert_run(record: dict[str, Any], path: str | Path | None = None) -> None:
     db_path = _resolve_path(path)
 
-    tool_args = record.get("tool_args", {})
-    tool_args_json = json.dumps(tool_args, ensure_ascii=False)
+    tool_args_json = safe_serialize_tool_result(record.get("tool_args", {}))
 
     tool_result = record.get("tool_result")
     tool_result_json: str | None = None
     if tool_result is not None:
-        try:
-            tool_result_json = json.dumps(tool_result, ensure_ascii=False)
-        except TypeError:
-            tool_result_json = None
+        tool_result_json = safe_serialize_tool_result(tool_result)
 
     with sqlite3.connect(db_path, check_same_thread=False) as conn:
         conn.execute(
