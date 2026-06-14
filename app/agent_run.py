@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 # status 描述"这次 run 在工程链路里走到哪一步",不是业务结果。
@@ -34,6 +35,29 @@ class AgentWarning:
     message: str
 
 
+def _now_iso() -> str:
+    """当前 UTC 时间的 ISO 8601 字符串。timeline event 的时间戳都走这里,保证格式一致。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class TimelineEvent:
+    """agent run 生命周期中的一个关键节点,按执行顺序追加到 AgentRun.timeline。
+
+    名字(name)是固定枚举,见 app/diagnostics.py 里的命名约定;
+    时间戳(at)用 ISO 8601 UTC;detail 是可选的轻量上下文(短字符串,不存堆栈/大对象,
+    避免 timeline 把 trace 体积撑爆,也不泄露敏感内容)。
+    """
+    name: str
+    at: str
+    detail: str | None = None
+
+    @classmethod
+    def now(cls, name: str, detail: str | None = None) -> "TimelineEvent":
+        """快速构造:用当前 UTC 时间戳。dispatcher 7 个事件点都走这个。"""
+        return cls(name=name, at=_now_iso(), detail=detail)
+
+
 @dataclass
 class AgentRun:
     run_id: str
@@ -48,3 +72,8 @@ class AgentRun:
     # warnings: 非致命降级事件列表。常见来源:
     # - TOOL_RESULT_SERIALIZATION_FALLBACK: tool_result 不可 JSON 序列化,已走 fallback
     warnings: list[AgentWarning] = field(default_factory=list)
+    # timeline: 这次 run 按时间顺序的关键事件点(诊断 / 可观测用)。
+    # 失败分支也记录(比如 tool_not_found 也会记 validation_failed),保证
+    # 客户端从 timeline 能直接定位失败发生在哪个阶段,不必去日志里翻。
+    # 7 类固定事件名见 app/diagnostics.py 顶部的 EVENT_NAMES 注释。
+    timeline: list[TimelineEvent] = field(default_factory=list)

@@ -74,6 +74,27 @@ def deserialize_warnings(raw: str | None) -> list[dict[str, str]]:
     return json.loads(raw)
 
 
+def serialize_timeline(timeline: list) -> str | None:
+    """把 list[TimelineEvent] 序列化成 JSON 字符串存进 DB。空 list 返 None。
+
+    timeline 里每个事件都已经是 {name, at, detail} 三字段(dataclass 转 dict),
+    不会再失败;detail 可能是 None,JSON 原样保留。
+    """
+    if not timeline:
+        return None
+    return json.dumps(
+        [{"name": ev.name, "at": ev.at, "detail": ev.detail} for ev in timeline],
+        ensure_ascii=False,
+    )
+
+
+def deserialize_timeline(raw: str | None) -> list[dict[str, str | None]]:
+    """DB 里读出来的 timeline JSON 反序列化成 [{"name", "at", "detail"}, ...]。无返 []。"""
+    if raw is None:
+        return []
+    return json.loads(raw)
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """把 sqlite Row 还原成跟 AgentRun 字段一一对应的 dict。
 
@@ -94,6 +115,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         }
 
     warnings = deserialize_warnings(row["warnings"]) if "warnings" in row.keys() else []
+    timeline = deserialize_timeline(row["timeline"]) if "timeline" in row.keys() else []
 
     return {
         "run_id": row["run_id"],
@@ -104,6 +126,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "error": error,
         "warnings": warnings,
+        "timeline": timeline,
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
     }
@@ -125,6 +148,7 @@ def init_db(path: str | Path | None = None) -> None:
                 error_code     TEXT,
                 error_message  TEXT,
                 warnings       TEXT,
+                timeline       TEXT,
                 started_at     TEXT NOT NULL,
                 finished_at    TEXT NOT NULL
             )
@@ -133,6 +157,11 @@ def init_db(path: str | Path | None = None) -> None:
         # 兼容老 DB:如果表是 v1 schema(没 warnings 列),用 ALTER TABLE 加上
         try:
             conn.execute("ALTER TABLE agent_runs ADD COLUMN warnings TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在(新建表或已经迁移过)
+        # 兼容老 DB:如果表是 v2 schema(没 timeline 列),用 ALTER TABLE 加上
+        try:
+            conn.execute("ALTER TABLE agent_runs ADD COLUMN timeline TEXT")
         except sqlite3.OperationalError:
             pass  # 列已存在(新建表或已经迁移过)
         conn.execute(
@@ -154,6 +183,7 @@ def insert_run(record: dict[str, Any], path: str | Path | None = None) -> None:
         tool_result_json = safe_serialize_tool_result(tool_result)
 
     warnings_json = serialize_warnings(record.get("warnings", []))
+    timeline_json = serialize_timeline(record.get("timeline", []))
 
     with sqlite3.connect(db_path, check_same_thread=False) as conn:
         conn.execute(
@@ -168,10 +198,11 @@ def insert_run(record: dict[str, Any], path: str | Path | None = None) -> None:
                 error_code,
                 error_message,
                 warnings,
+                timeline,
                 started_at,
                 finished_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["run_id"],
@@ -183,6 +214,7 @@ def insert_run(record: dict[str, Any], path: str | Path | None = None) -> None:
                 record.get("error_code"),
                 record.get("error_message"),
                 warnings_json,
+                timeline_json,
                 record["started_at"],
                 record["finished_at"],
             ),
@@ -206,6 +238,7 @@ def get_run(run_id: str, path: str | Path | None = None) -> dict[str, Any] | Non
                 error_code,
                 error_message,
                 warnings,
+                timeline,
                 started_at,
                 finished_at
             FROM agent_runs
@@ -242,6 +275,7 @@ def list_runs(
                 error_code,
                 error_message,
                 warnings,
+                timeline,
                 started_at,
                 finished_at
             FROM agent_runs

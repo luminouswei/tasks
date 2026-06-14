@@ -2,7 +2,9 @@
 
 最小可用的 AI agent 工具调用后端:每次请求产生一条 `AgentRun`
 记录(包含 `status`、开始/结束时间戳、工具入参、错误信封、
-降级警告 `warnings`),落 SQLite,支持列表与单条查询。
+降级警告 `warnings`、执行时间线 `timeline`),落 SQLite,支持列表、
+单条查询、以及**结构化运行诊断**(`GET /agent/runs/{id}/diagnostics`),
+失败时直接看到失败类型 + 关键事件时间线 + 下一步建议。
 
 ## 安装
 
@@ -268,6 +270,128 @@ Query 参数:
 }
 ```
 
+### GET /agent/runs/{run_id}/diagnostics
+
+按 id 查一次 run 的**结构化诊断视图**(给运维 / 开发者用)。
+跟 `GET /agent/runs/{run_id}`(10 字段 trace)分开:这个端点把 status /
+error / warnings 翻译成"这次 run 失败在哪里 / 下一步该看什么"。
+
+```bash
+curl http://127.0.0.1:8000/agent/runs/<run_id>/diagnostics
+```
+
+未命中(404):
+
+```json
+{"error": {"code": "RUN_NOT_FOUND", "message": "run 'xxx' was not found"}}
+```
+
+成功(200),7 字段稳定形态:
+
+| 字段 | 含义 |
+|---|---|
+| `run_id` | 32 字符 hex,跟 `GET /agent/runs/{id}` 一致 |
+| `status` | 跟 `AgentRun.status` 一致(`completed` / `failed` / `trace_persist_failed`) |
+| `failure_type` | 5 闭集:`validation_error` / `tool_error` / `serialization_error` / `persistence_error` / `unknown`,成功且无降级时为 `null` |
+| `failure_message` | 失败原因(已脱敏),成功为 `null` |
+| `timeline` | 按时间顺序的关键事件点,每条 `{name, at, detail}` |
+| `diagnostic_summary` | 一句话描述这次 run |
+| `suggested_action` | failure_type 对应的下一步建议,成功为 `null` |
+
+#### `failure_type` 的 5 个值
+
+| 值 | 触发场景(error.code / warning.code) |
+|---|---|
+| `validation_error` | `TOOL_INPUT_ERROR`, `TOOL_NOT_FOUND` — 用户责任 |
+| `tool_error` | `TOOL_EXECUTION_ERROR` — 工具责任 |
+| `serialization_error` | warning 里有 `TOOL_RESULT_SERIALIZATION_FALLBACK`(run 仍 success,只是 tool_result 走了 fallback) |
+| `persistence_error` | `TRACE_PERSIST_FAILED` — trace 落库失败 |
+| `unknown` | `INTERNAL_ERROR` 或任何没匹配上的 code |
+
+#### timeline 事件名(7 类,按执行顺序)
+
+```
+request_received
+validation_passed | validation_failed
+tool_dispatch_started
+tool_executed | tool_failed
+trace_serialized | trace_serialization_fallback
+trace_persisted | trace_persist_failed
+response_returned
+```
+
+失败分支也记(`validation_failed` / `tool_failed` / `trace_persist_failed`),
+客户端从 timeline 第一条到最后一条能直接定位"卡在哪个阶段"。
+
+#### 成功示例
+
+```json
+{
+  "run_id": "9f1c...",
+  "status": "completed",
+  "failure_type": null,
+  "failure_message": null,
+  "timeline": [
+    {"name": "request_received", "at": "2026-06-14T00:00:00.000+00:00", "detail": "tool=calculator"},
+    {"name": "validation_passed", "at": "2026-06-14T00:00:00.000+00:00", "detail": null},
+    {"name": "tool_dispatch_started", "at": "2026-06-14T00:00:00.000+00:00", "detail": "calculator"},
+    {"name": "tool_executed", "at": "2026-06-14T00:00:00.005+00:00", "detail": null},
+    {"name": "trace_serialized", "at": "2026-06-14T00:00:00.005+00:00", "detail": null},
+    {"name": "trace_persisted", "at": "2026-06-14T00:00:00.005+00:00", "detail": null},
+    {"name": "response_returned", "at": "2026-06-14T00:00:00.005+00:00", "detail": null}
+  ],
+  "diagnostic_summary": "Run completed in 5ms via calculator.",
+  "suggested_action": null
+}
+```
+
+#### 失败示例(工具抛 `ToolExecutionError`)
+
+```json
+{
+  "run_id": "a3b1...",
+  "status": "failed",
+  "failure_type": "tool_error",
+  "failure_message": "weather API timed out",
+  "timeline": [
+    {"name": "request_received", "at": "2026-06-14T00:00:00.000+00:00", "detail": "tool=weather"},
+    {"name": "validation_passed", "at": "2026-06-14T00:00:00.000+00:00", "detail": null},
+    {"name": "tool_dispatch_started", "at": "2026-06-14T00:00:00.000+00:00", "detail": "weather"},
+    {"name": "tool_failed", "at": "2026-06-14T00:00:00.500+00:00", "detail": "TOOL_EXECUTION_ERROR"},
+    {"name": "trace_persisted", "at": "2026-06-14T00:00:00.500+00:00", "detail": null},
+    {"name": "response_returned", "at": "2026-06-14T00:00:00.500+00:00", "detail": null}
+  ],
+  "diagnostic_summary": "Run failed during tool execution via weather: weather API timed out.",
+  "suggested_action": "inspect tool health and recent tool logs"
+}
+```
+
+#### 降级示例(不可 JSON 序列化的 tool_result)
+
+成功 + `TOOL_RESULT_SERIALIZATION_FALLBACK` warning → `failure_type="serialization_error"`,
+`status` 仍 `completed`,timeline 末段把 `trace_serialized` 换成 `trace_serialization_fallback`,
+tool_result 是结构化 fallback 形态:
+
+```json
+{
+  "run_id": "...",
+  "status": "completed",
+  "failure_type": "serialization_error",
+  "failure_message": null,
+  "timeline": [
+    {"name": "request_received", "at": "...", "detail": "tool=custom"},
+    {"name": "validation_passed", "at": "...", "detail": null},
+    {"name": "tool_dispatch_started", "at": "...", "detail": "custom"},
+    {"name": "tool_executed", "at": "...", "detail": null},
+    {"name": "trace_serialization_fallback", "at": "...", "detail": "set"},
+    {"name": "trace_persisted", "at": "...", "detail": null},
+    {"name": "response_returned", "at": "...", "detail": null}
+  ],
+  "diagnostic_summary": "Run completed via custom with serialization fallback; tool result is a safe repr.",
+  "suggested_action": "verify tool returns JSON-serializable values"
+}
+```
+
 ### Debug recipe:一次失败调用的复盘
 
 ```bash
@@ -279,7 +403,10 @@ curl -X POST http://127.0.0.1:8000/agent/run \
 # 2. 用 run_id 查完整 trace
 curl http://127.0.0.1:8000/agent/runs/<run_id>
 
-# 3. 看最近 20 条调用
+# 3. 查结构化诊断视图 — failure_type + timeline + suggested_action
+curl http://127.0.0.1:8000/agent/runs/<run_id>/diagnostics
+
+# 4. 看最近 20 条调用
 curl 'http://127.0.0.1:8000/agent/runs?limit=20'
 ```
 

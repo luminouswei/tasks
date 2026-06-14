@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from app.agent_run import AgentErrorPayload, AgentRun, AgentWarning
+from app.agent_run import AgentErrorPayload, AgentRun, AgentWarning, TimelineEvent
 
 
 def _parse_iso(timestamp: str) -> datetime:
@@ -174,3 +174,61 @@ def test_agent_run_tool_args_structure():
 
     assert run.tool_args == {"message": "12 * 8"}
     assert run.tool_args["message"] == run.input
+
+
+# ---------- TimelineEvent + AgentRun.timeline ----------
+
+
+def test_timeline_event_now_factory_uses_utc_iso():
+    """TimelineEvent.now() 用 UTC ISO 8601 时间戳(客户端解析不抛)。"""
+    ev = TimelineEvent.now("test_event")
+    assert ev.name == "test_event"
+    # 能被 datetime.fromisoformat 解析就是合法 ISO 8601
+    datetime.fromisoformat(ev.at)
+    assert ev.detail is None  # 不传 detail 默认 None
+
+
+def test_timeline_event_now_with_detail():
+    """TimelineEvent.now(name, detail) 把 detail 一起带过去(给运维/告警用)。"""
+    ev = TimelineEvent.now("tool_failed", detail="TOOL_EXECUTION_ERROR")
+    assert ev.name == "tool_failed"
+    assert ev.detail == "TOOL_EXECUTION_ERROR"
+
+
+def test_agent_run_timeline_defaults_to_empty():
+    """AgentRun 不传 timeline 时是空列表(向后兼容,旧代码构造不破)。"""
+    run = AgentRun(
+        run_id="i" * 32,
+        input="x",
+        selected_tool="echo",
+        tool_args={},
+        tool_result="x",
+        status="completed",
+        error=None,
+        started_at="2026-06-10T08:00:00+00:00",
+        finished_at="2026-06-10T08:00:00.001+00:00",
+    )
+    assert run.timeline == []
+
+
+def test_agent_run_with_timeline_construction():
+    """AgentRun 可以带 timeline 构造(诊断视图直接用)。"""
+    timeline = [
+        TimelineEvent(name="request_received", at="2026-06-10T08:00:00+00:00"),
+        TimelineEvent(name="response_returned", at="2026-06-10T08:00:00.001+00:00"),
+    ]
+    run = AgentRun(
+        run_id="j" * 32,
+        input="x",
+        selected_tool="echo",
+        tool_args={},
+        tool_result="x",
+        status="completed",
+        error=None,
+        started_at="2026-06-10T08:00:00+00:00",
+        finished_at="2026-06-10T08:00:00.001+00:00",
+        timeline=timeline,
+    )
+    assert len(run.timeline) == 2
+    assert run.timeline[0].name == "request_received"
+    assert run.timeline[1].name == "response_returned"

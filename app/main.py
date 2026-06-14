@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 import app.tools  # noqa: F401  # 触发工具自注册
 from app.agent_run import AgentRun
 from app.agent_run_store import get_run, init_db, list_runs
+from app.diagnostics import build_diagnostics
 from app.dispatcher import DispatchResult, dispatch
 from app.errors import CODE_TO_STATUS
 from app.models import RunRequest
@@ -217,3 +218,88 @@ def get_agent_run(run_id: str):
         return _run_response_body(run)
 
     return _not_found_response(run_id)
+
+
+# ---------- 诊断视图 ----------
+
+# 诊断视图的 7 字段响应契约。所有 GET /agent/runs/{id}/diagnostics 命中都返这 7 个 key;
+# 字段值不随成功 / 失败 / 降级变化,客户端解析逻辑可以稳定。
+DIAGNOSTICS_RESPONSE_KEYS = (
+    "run_id", "status", "failure_type", "failure_message",
+    "timeline", "diagnostic_summary", "suggested_action",
+)
+
+
+def _diagnostics_to_response(diagnostics) -> dict[str, Any]:
+    """Diagnostics dataclass -> API 响应 dict(7 字段稳定形态)。"""
+    return {
+        "run_id": diagnostics.run_id,
+        "status": diagnostics.status,
+        "failure_type": diagnostics.failure_type,
+        "failure_message": diagnostics.failure_message,
+        "timeline": diagnostics.timeline,
+        "diagnostic_summary": diagnostics.diagnostic_summary,
+        "suggested_action": diagnostics.suggested_action,
+    }
+
+
+@app.get("/agent/runs/{run_id}/diagnostics")
+def get_agent_run_diagnostics(run_id: str):
+    """返回这次 run 的结构化诊断视图,给运维 / 开发者用。
+
+    - 200: 7 字段稳定形态(failure_type, timeline, summary, suggested_action 等)
+    - 404: RUN_NOT_FOUND(找不到的 run_id)
+
+    diagnostics 是**只读派生视图**:从 AgentRun(status / error / warnings / timeline)
+    翻译而来,业务执行链路不受影响。改判定规则只动 app/diagnostics.py。
+    """
+    run = get_run(run_id)
+
+    if run is None:
+        return _not_found_response(run_id)
+
+    # store 返回的是 dict(已经是 AgentRun 字段形态);直接喂给 build_diagnostics,
+    # 避免再走 dataclass 构造一次。AgentRun.error 在 dict 里是 dict,在
+    # build_diagnostics 里我们访问 run.error 是为了从 dataclass 取,但因为
+    # 字段命名一致(diagnostics 实际上只用 error.code / error.message /
+    # warnings / timeline / status),直接构造一个等价的 AgentRun dataclass
+    # 给 build_diagnostics 用最稳。
+    from app.agent_run import AgentErrorPayload
+
+    error = None
+    if run.get("error"):
+        error = AgentErrorPayload(
+            code=run["error"]["code"],
+            message=run["error"]["message"],
+        )
+
+    from app.agent_run import AgentWarning
+    warnings = [
+        AgentWarning(code=w["code"], message=w["message"])
+        for w in run.get("warnings", [])
+    ]
+
+    # timeline 在 store 里已经是 dict 列表(name/at/detail),
+    # build_diagnostics 内部会再 copy 一次,语义无副作用。
+    from app.agent_run import TimelineEvent
+    timeline = [
+        TimelineEvent(name=ev["name"], at=ev["at"], detail=ev.get("detail"))
+        for ev in run.get("timeline", [])
+    ]
+
+    run_obj = AgentRun(
+        run_id=run["run_id"],
+        input=run["input"],
+        selected_tool=run["selected_tool"],
+        tool_args=run["tool_args"],
+        tool_result=run["tool_result"],
+        status=run["status"],
+        error=error,
+        started_at=run["started_at"],
+        finished_at=run["finished_at"],
+        warnings=warnings,
+        timeline=timeline,
+    )
+
+    diagnostics = build_diagnostics(run_obj)
+    return _diagnostics_to_response(diagnostics)
