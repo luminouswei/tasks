@@ -294,3 +294,128 @@ def test_dispatch_surfaces_persistence_failure(monkeypatch, tmp_path):
     assert result.run.error.code == "TRACE_PERSIST_FAILED"
     assert "RuntimeError" in result.run.error.message
     assert "disk full" in result.run.error.message
+    # timeline 仍然完整:trace_persisted 被替换成 trace_persist_failed,
+    # response_returned 保留(响应确实出去了)
+    event_names = [ev.name for ev in result.run.timeline]
+    assert "trace_persist_failed" in event_names
+    assert "response_returned" in event_names
+    assert "trace_persisted" not in event_names
+    # trace_persist_failed 的 detail 是异常类名(operator-facing)
+    failed_event = next(
+        ev for ev in result.run.timeline if ev.name == "trace_persist_failed"
+    )
+    assert failed_event.detail == "RuntimeError"
+
+
+# ---------- 6. timeline 事件按执行顺序记录(含失败分支) ----------
+
+
+def test_dispatch_success_timeline_has_7_events_in_order(temp_agent_run_db):
+    """成功 run → 7 个事件按执行顺序:
+    request_received, validation_passed, tool_dispatch_started,
+    tool_executed, trace_serialized, trace_persisted, response_returned
+    """
+    def fake_run(message: str):
+        return {"echo": message}
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    event_names = [ev.name for ev in result.run.timeline]
+    assert event_names == [
+        "request_received", "validation_passed", "tool_dispatch_started",
+        "tool_executed", "trace_serialized", "trace_persisted",
+        "response_returned",
+    ]
+
+
+def test_dispatch_timeline_events_have_iso_timestamps(temp_agent_run_db):
+    """timeline 事件时间戳是 ISO 8601 字符串,客户端可以解析。"""
+    from datetime import datetime
+    def fake_run(message: str):
+        return message
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    for ev in result.run.timeline:
+        datetime.fromisoformat(ev.at)  # 解析不抛即合法
+
+
+def test_dispatch_timeline_tool_not_found_uses_validation_failed(temp_agent_run_db):
+    """tool 不存在 → timeline 走 validation_failed 分支,不会记 tool_dispatch_started。"""
+    result = dispatch("missing", "hi")
+
+    event_names = [ev.name for ev in result.run.timeline]
+    assert "request_received" in event_names
+    assert "validation_failed" in event_names
+    assert "tool_dispatch_started" not in event_names
+    # 但 trace_persisted + response_returned 仍然记(响应确实出去了,只是没真正持久化到 DB 的 run 是 failed 形态)
+    assert "trace_persisted" in event_names
+    assert "response_returned" in event_names
+    # validation_failed 的 detail 是 error.code(便于查询/告警)
+    failed_event = next(
+        ev for ev in result.run.timeline if ev.name == "validation_failed"
+    )
+    assert failed_event.detail == "TOOL_NOT_FOUND"
+
+
+def test_dispatch_timeline_tool_execution_error_uses_tool_failed(temp_agent_run_db):
+    """tool 抛 ToolExecutionError → tool_failed 事件,detail=TOOL_EXECUTION_ERROR。"""
+    def fake_run(message: str):
+        raise ToolExecutionError("internal tool bug")
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    event_names = [ev.name for ev in result.run.timeline]
+    assert "validation_passed" in event_names
+    assert "tool_dispatch_started" in event_names
+    assert "tool_failed" in event_names
+    assert "tool_executed" not in event_names
+    failed_event = next(
+        ev for ev in result.run.timeline if ev.name == "tool_failed"
+    )
+    assert failed_event.detail == "TOOL_EXECUTION_ERROR"
+
+
+def test_dispatch_timeline_unserializable_records_serialization_fallback(temp_agent_run_db):
+    """不可 JSON 序列化的 tool_result → trace_serialization_fallback 事件,不是 trace_serialized。"""
+    def fake_run(message: str):
+        return {1, 2, 3}  # set
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    event_names = [ev.name for ev in result.run.timeline]
+    assert "tool_executed" in event_names
+    assert "trace_serialization_fallback" in event_names
+    assert "trace_serialized" not in event_names
+    fallback_event = next(
+        ev for ev in result.run.timeline if ev.name == "trace_serialization_fallback"
+    )
+    # detail 是不可序列化值的类型名(运维一眼看到是哪种类型)
+    assert fallback_event.detail == "set"
+
+
+def test_dispatch_timeline_persists_to_db(temp_agent_run_db):
+    """DB 里的 timeline 跟 in-memory AgentRun.timeline 一致(都是完整 7 事件)。
+
+    关键:DB 不能丢 trace_persisted / response_returned 这两条(否则 GET diagnostics
+    拿到的 timeline 就缺尾部,跟 dispatch 内存响应里的对不上,会出诡异 bug)。
+    """
+    def fake_run(message: str):
+        return message
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    loaded = get_run(result.run.run_id, temp_agent_run_db)
+    assert loaded is not None
+    loaded_events = [ev["name"] for ev in loaded["timeline"]]
+    mem_events = [ev.name for ev in result.run.timeline]
+    assert loaded_events == mem_events
+    # 完整 7 条
+    assert len(loaded_events) == 7
+    assert "trace_persisted" in loaded_events
+    assert "response_returned" in loaded_events
