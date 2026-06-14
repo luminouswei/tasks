@@ -1,6 +1,6 @@
 import pytest
 
-from app.errors import ToolExecutionError
+from app.errors import ToolInputError
 from app.parser import parse_and_eval
 
 
@@ -29,22 +29,24 @@ def test_parentheses():
 
 
 def test_division_by_zero():
-    with pytest.raises(ToolExecutionError) as exc_info:
+    """除零是用户输入错(用户给了 0 作除数),走 ToolInputError(HTTP 400)。"""
+    with pytest.raises(ToolInputError) as exc_info:
         parse_and_eval("1/0")
 
     assert "division" in exc_info.value.message.lower()
 
 
 def test_invalid_double_operator():
-    with pytest.raises(ToolExecutionError):
+    """非法表达式是用户输入错,走 ToolInputError。"""
+    with pytest.raises(ToolInputError):
         parse_and_eval("1++")
 
 
 def test_invalid_character():
-    with pytest.raises(ToolExecutionError):
+    with pytest.raises(ToolInputError):
         parse_and_eval("1 + a")
 
 
 def test_empty_expression():
-    with pytest.raises(ToolExecutionError):
+    with pytest.raises(ToolInputError):
         parse_and_eval("")

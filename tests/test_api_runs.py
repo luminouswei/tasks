@@ -2,6 +2,14 @@ import re
 from datetime import datetime
 
 
+# 10 字段契约:所有响应都包含这 10 个 key
+ALL_AGENT_RUN_KEYS = (
+    "run_id", "input", "selected_tool", "tool_args",
+    "tool_result", "status", "error", "warnings",
+    "started_at", "finished_at",
+)
+
+
 # ---------- POST /agent/run ----------
 
 
@@ -14,11 +22,15 @@ def test_post_calculator_success(client):
     assert response.status_code == 200
     body = response.json()
 
+    for key in ALL_AGENT_RUN_KEYS:
+        assert key in body, f"missing key: {key}"
+
     assert re.fullmatch(r"[0-9a-f]{32}", body["run_id"])
-    assert body["status"] == "success"
+    assert body["status"] == "completed"
     assert body["tool_result"] == 96
     assert body["selected_tool"] == "calculator"
     assert body["error"] is None
+    assert body["warnings"] == []
     # 时间戳能解析,且 started < finished
     started = datetime.fromisoformat(body["started_at"])
     finished = datetime.fromisoformat(body["finished_at"])
@@ -34,13 +46,14 @@ def test_post_echo_success(client):
     assert response.status_code == 200
     body = response.json()
 
-    assert body["status"] == "success"
+    assert body["status"] == "completed"
     assert body["tool_result"] == "hi"
     assert body["selected_tool"] == "echo"
+    assert body["warnings"] == []
 
 
 def test_post_tool_not_found(client):
-    """tool 不存在 → 404,status=tool_not_found,但 run_id 仍返回(失败也落库)。"""
+    """tool 不存在 → 404,status=failed,error.code=TOOL_NOT_FOUND,但 run_id 仍返回(失败也落库)。"""
     response = client.post(
         "/agent/run",
         json={"message": "hi", "tool": "weather"},
@@ -49,14 +62,20 @@ def test_post_tool_not_found(client):
     assert response.status_code == 404
     body = response.json()
 
+    for key in ALL_AGENT_RUN_KEYS:
+        assert key in body, f"missing key: {key}"
+
     assert re.fullmatch(r"[0-9a-f]{32}", body["run_id"])
-    assert body["status"] == "tool_not_found"
+    assert body["status"] == "failed"
     assert body["error"]["code"] == "TOOL_NOT_FOUND"
     assert body["selected_tool"] == "weather"
 
 
-def test_post_tool_execution_error(client):
-    """calculator "1/0" → 400,status=tool_error。"""
+def test_post_calculator_division_by_zero_is_tool_input_error(client):
+    """calculator "1/0" → 400 TOOL_INPUT_ERROR(用户责任,改请求重发即可)。
+
+    跟工具内部崩区分:用户给 0 作除数是用户错,HTTP 400,不需要告警。
+    """
     response = client.post(
         "/agent/run",
         json={"message": "1/0", "tool": "calculator"},
@@ -65,10 +84,27 @@ def test_post_tool_execution_error(client):
     assert response.status_code == 400
     body = response.json()
 
+    for key in ALL_AGENT_RUN_KEYS:
+        assert key in body, f"missing key: {key}"
+
     assert re.fullmatch(r"[0-9a-f]{32}", body["run_id"])
-    assert body["status"] == "tool_error"
-    assert body["error"]["code"] == "TOOL_EXECUTION_ERROR"
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == "TOOL_INPUT_ERROR"
     assert body["selected_tool"] == "calculator"
+
+
+def test_post_calculator_invalid_expression_is_tool_input_error(client):
+    """非法表达式(用户给乱码)→ 400 TOOL_INPUT_ERROR。"""
+    response = client.post(
+        "/agent/run",
+        json={"message": "1 + a", "tool": "calculator"},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == "TOOL_INPUT_ERROR"
 
 
 def test_post_validation_error_no_message(client):
@@ -89,7 +125,7 @@ def test_post_validation_error_no_message(client):
 
 
 def test_get_run_by_id_success(client):
-    """POST 一次成功,拿 run_id,GET 拿回完整 trace。"""
+    """POST 一次成功,拿 run_id,GET 拿回完整 trace(10 字段)。"""
     post = client.post(
         "/agent/run",
         json={"message": "12 * 8", "tool": "calculator"},
@@ -101,21 +137,18 @@ def test_get_run_by_id_success(client):
     assert response.status_code == 200
     body = response.json()
 
-    # AgentRun 全字段都在
-    for key in (
-        "run_id", "input", "selected_tool", "tool_args",
-        "tool_result", "status", "error",
-        "started_at", "finished_at",
-    ):
-        assert key in body
+    # 10 字段都在
+    for key in ALL_AGENT_RUN_KEYS:
+        assert key in body, f"missing key: {key}"
 
     assert body["run_id"] == run_id
     assert body["input"] == "12 * 8"
     assert body["selected_tool"] == "calculator"
     assert body["tool_args"] == {"message": "12 * 8"}
     assert body["tool_result"] == 96
-    assert body["status"] == "success"
+    assert body["status"] == "completed"
     assert body["error"] is None
+    assert body["warnings"] == []
 
 
 def test_get_run_by_id_not_found(client):
@@ -147,6 +180,9 @@ def test_list_runs_returns_all_sorted_by_started_at_desc(client):
     assert len(body["runs"]) == 3
     # 倒序:c 最新,b,a 最老
     assert [r["input"] for r in body["runs"]] == ["c", "b", "a"]
+    # list items 也带 warnings 字段
+    for r in body["runs"]:
+        assert r["warnings"] == []
 
 
 def test_list_runs_pagination(client):
@@ -209,8 +245,8 @@ def test_legacy_traces_endpoint_404(client):
 
 def test_run_endpoint_returns_500_when_trace_persist_fails(client, monkeypatch):
     """dispatcher.insert_run 抛异常 → POST /agent/run 返 500,
-    响应体仍 9 字段,error.code = TRACE_PERSIST_FAILED,
-    业务结果(success + tool_result)被覆盖成 None(因为 trace 没拿到)。
+    响应体仍 10 字段,error.code = TRACE_PERSIST_FAILED,
+    业务结果(completed + tool_result)被覆盖成 None(因为 trace 没拿到)。
     """
     def broken_insert_run(record, path=None):
         raise RuntimeError("disk full: simulated")
@@ -224,17 +260,13 @@ def test_run_endpoint_returns_500_when_trace_persist_fails(client, monkeypatch):
     assert response.status_code == 500
     body = response.json()
 
-    # 9 字段都在(契约不破)
-    for key in (
-        "run_id", "input", "selected_tool", "tool_args",
-        "tool_result", "status", "error",
-        "started_at", "finished_at",
-    ):
-        assert key in body
+    # 10 字段都在(契约不破)
+    for key in ALL_AGENT_RUN_KEYS:
+        assert key in body, f"missing key: {key}"
 
-    # 业务执行成功了,所以 status=success;但 trace 没记下来
-    assert body["status"] == "success"
-    # error.code 显式带出失败原因,跟现有 4 类业务错误平级
+    # 业务执行成功了,所以 status=trace_persist_failed(盖在 completed 上);trace 没记下来
+    assert body["status"] == "trace_persist_failed"
+    # error.code 显式带出失败原因
     assert body["error"]["code"] == "TRACE_PERSIST_FAILED"
     assert "disk full" in body["error"]["message"]
     # tool_result 强制 None(trace 没记,客户端拿到也不能信)

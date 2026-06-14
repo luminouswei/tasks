@@ -73,7 +73,7 @@ async def unhandled_exception_handler(request, exc: Exception):
 
 
 def _run_response_body(run: dict[str, Any]) -> dict[str, Any]:
-    """把 store 返回的 dict(已经是 AgentRun 形态)统一组装成 HTTP 响应需要的 9 字段。
+    """把 store 返回的 dict(已经是 AgentRun 形态)统一组装成 HTTP 响应需要的 10 字段。
 
     成功 / 失败 / list item / GET single 都走这里,保证 API 端响应形态完全一致。
     """
@@ -85,18 +85,23 @@ def _run_response_body(run: dict[str, Any]) -> dict[str, Any]:
         "status": run["status"],
         "tool_result": run["tool_result"],
         "error": run["error"],
+        "warnings": run.get("warnings", []),
         "started_at": run["started_at"],
         "finished_at": run["finished_at"],
     }
 
 
 def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
-    """AgentRun -> API 响应 dict(9 字段一致形态)。
+    """AgentRun -> API 响应 dict(10 字段一致形态)。
 
-    成功时 tool_result 填值、error 为 None;业务失败时 tool_result 强制 None、
-    error 为 {code, message};trace 持久化失败时用 TRACE_PERSIST_FAILED
-    覆盖 error 字段(优先级高于业务 error,告诉调用方"业务结果拿到了但没记下来")。
-    POST 和 replay 走这条路径,GET 走 _run_response_body。
+    字段契约:
+    - run_id / input / selected_tool / tool_args / status /
+      started_at / finished_at: 总是返回
+    - tool_result: 业务成功时填值,业务失败 / trace 失败时强制 null
+    - error: 业务失败 / trace 失败时填 {code, message},业务成功时 null
+    - warnings: 非空时填 list[{code, message}],空时 [] (跟 "无 warning" 区分开)
+
+    POST 和 replay 走这条路径,GET 走 _run_response_body(也走它,保持 10 字段一致)。
     """
     body: dict[str, Any] = {
         "run_id": run.run_id,
@@ -104,41 +109,40 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
         "selected_tool": run.selected_tool,
         "tool_args": run.tool_args,
         "status": run.status,
+        "tool_result": run.tool_result,
+        "error": None,
+        "warnings": [{"code": w.code, "message": w.message} for w in run.warnings],
         "started_at": run.started_at,
         "finished_at": run.finished_at,
     }
-    if run.trace_persistence == "failed":
-        body["error"] = {
-            "code": "TRACE_PERSIST_FAILED",
-            "message": run.trace_error or "trace persistence failed",
-        }
-        body["tool_result"] = None
-    elif run.error is not None:
+    if run.error is not None:
         body["error"] = {
             "code": run.error.code,
             "message": run.error.message,
         }
-        body["tool_result"] = None
-    else:
-        body["error"] = None
-        body["tool_result"] = run.tool_result
+        # 业务失败 / trace 失败时 tool_result 强制 null:
+        # - 业务失败:工具没拿到结果,tool_result 没意义
+        # - trace 失败:业务结果拿到了但没记下来,客户端拿到也不能信
+        if run.error.code == "TRACE_PERSIST_FAILED":
+            body["tool_result"] = None
+        # 业务失败时 tool_result 在 dispatcher 里就设了 None,这里不再覆盖
     return body
 
 
 def _dispatch_to_response(result: DispatchResult) -> dict[str, Any] | JSONResponse:
     """把 DispatchResult 翻译成 HTTP 响应。
 
-    - trace 持久化失败 -> 500(优先级最高,业务结果虽然拿到了但需要可观测性告警)
-    - 业务成功 -> 200 dict
-    - 业务失败 -> 按 CODE_TO_STATUS 返 4xx/5xx JSONResponse
+    - status == "trace_persist_failed" -> 500(trace 落库失败,但业务结果已拿到)
+    - 业务成功(status == "completed") -> 200
+    - 业务失败(status == "failed" + error 有值) -> 按 CODE_TO_STATUS 返 4xx/5xx
 
     POST /agent/run 和 POST /agent/runs/{id}/replay 共用,保证两条路径响应形态完全一致。
     """
     run = result.run
 
-    if run.trace_persistence == "failed":
+    if run.status == "trace_persist_failed":
         return JSONResponse(
-            status_code=500,
+            status_code=CODE_TO_STATUS.get("TRACE_PERSIST_FAILED", 500),
             content=_agent_run_to_response_dict(run),
         )
 
