@@ -86,6 +86,12 @@ validation 阶段失败(422,请求体校验未通过,**不**生成 run):
 | 未预期异常(dispatch) | 500 | `INTERNAL_ERROR` | 有 | `internal_error` |
 | 业务已执行但 trace 落库失败 | 500 | `TRACE_PERSIST_FAILED` | 有 | 业务 status(可能 `success` / `tool_error` / `internal_error`) |
 
+> validation 阶段错误不触发工具调用、不写 run,响应也不带 `run_id`。其它三个 dispatch 阶段**全部**会落库成 run 记录,失败也能用 `run_id` 查到完整 trace。
+>
+> `TRACE_PERSIST_FAILED` 跟上面三类业务错误是**正交**的:业务已经执行完(成功或失败),但 trace 落库这一步失败(DB 锁、磁盘满、权限错等)。调用方仍能拿到业务结果,响应体仍是 9 字段(只是 `tool_result` 强制 `null` + `error.code = TRACE_PERSIST_FAILED`)。需要后台告警/重试落库,但不该把这个错当成"业务失败"重发请求。
+>
+> 注意:`TRACE_PERSIST_FAILED` 状态**只在 API 响应和日志里出现,DB 里不保证有对应行**——如果落库失败,那行 `AgentRun` 记录可能根本不存在。后续的 `GET /agent/runs/{run_id}` 查不到这条 run 是符合预期的,不是 bug。
+
 ### 工具结果序列化 fallback
 
 当 `tool_result` 或 `tool_args` 包含无法被 `json.dumps` 直接序列化的值
