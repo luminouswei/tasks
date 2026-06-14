@@ -97,7 +97,10 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
     字段契约:
     - run_id / input / selected_tool / tool_args / status /
       started_at / finished_at: 总是返回
-    - tool_result: 业务成功时填值,业务失败 / trace 失败时强制 null
+    - tool_result: 业务执行过了就填值(成功 / 失败都填,看具体 dispatcher 怎么处理)
+      - 业务成功 → 工具返回值
+      - 业务失败 → dispatcher 已置 None(工具没拿到结果)
+      - trace 落库失败 → 业务结果保留(trace 失败不影响业务结果的可得性)
     - error: 业务失败 / trace 失败时填 {code, message},业务成功时 null
     - warnings: 非空时填 list[{code, message}],空时 [] (跟 "无 warning" 区分开)
 
@@ -120,12 +123,13 @@ def _agent_run_to_response_dict(run: AgentRun) -> dict[str, Any]:
             "code": run.error.code,
             "message": run.error.message,
         }
-        # 业务失败 / trace 失败时 tool_result 强制 null:
-        # - 业务失败:工具没拿到结果,tool_result 没意义
-        # - trace 失败:业务结果拿到了但没记下来,客户端拿到也不能信
-        if run.error.code == "TRACE_PERSIST_FAILED":
-            body["tool_result"] = None
-        # 业务失败时 tool_result 在 dispatcher 里就设了 None,这里不再覆盖
+        # 业务失败时 tool_result 在 dispatcher 里就设了 None(工具没拿到结果),
+        # 这里不再覆盖。
+        # **trace 落库失败时不覆盖 tool_result**——业务执行过了,业务结果
+        # 应当保留给调用方(他们已经付了工具调用的代价),只是观测落库失败。
+        # 客户端需要靠 error.code == "TRACE_PERSIST_FAILED" 区分"业务失败"
+        # 和"业务成功但 trace 没记",前者不该重试(已执行),后者**绝对不该**
+        # 当成业务失败重发请求(否则工具会被调两次)。
     return body
 
 
