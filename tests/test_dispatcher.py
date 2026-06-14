@@ -3,10 +3,11 @@ from datetime import datetime
 
 import pytest
 
+from app.agent_run import AgentWarning
 from app.agent_run_store import get_run, init_db
 from app import registry
 from app.dispatcher import dispatch
-from app.errors import ToolExecutionError
+from app.errors import ToolExecutionError, ToolInputError
 from app.registry import ToolSpec
 
 
@@ -36,7 +37,7 @@ def _register_fake(run):
     )
 
 
-# ---------- 1. run 形态:4 个 status 各自的字段断言 ----------
+# ---------- 1. 4 类业务结果都映射到 status=completed/failed + error.code ----------
 
 
 def test_dispatch_success(temp_agent_run_db):
@@ -46,37 +47,58 @@ def test_dispatch_success(temp_agent_run_db):
 
     result = dispatch("fake", "hi")
 
-    assert result.run.status == "success"
+    # 业务成功 → status=completed
+    assert result.run.status == "completed"
     assert result.run.tool_result == {"echo": "hi"}
     assert result.run.error is None
+    assert result.run.warnings == []
     assert result.run.selected_tool == "fake"
     assert result.run.input == "hi"
     assert re.fullmatch(r"[0-9a-f]{32}", result.run.run_id)
 
 
 def test_dispatch_tool_execution_error(temp_agent_run_db):
+    """工具内部崩(工具责任) → status=failed + TOOL_EXECUTION_ERROR(HTTP 500)。"""
     def fake_run(message: str):
-        raise ToolExecutionError("bad input")
+        raise ToolExecutionError("internal tool bug")
     _register_fake(fake_run)
 
     result = dispatch("fake", "hi")
 
-    assert result.run.status == "tool_error"
+    assert result.run.status == "failed"
     assert result.run.tool_result is None
     assert result.run.error is not None
     assert result.run.error.code == "TOOL_EXECUTION_ERROR"
-    assert result.run.error.message == "bad input"
+    assert result.run.error.message == "internal tool bug"
+
+
+def test_dispatch_tool_input_error(temp_agent_run_db):
+    """用户输入错(用户责任) → status=failed + TOOL_INPUT_ERROR(HTTP 400)。
+
+    跟 TOOL_EXECUTION_ERROR(HTTP 500)区分:用户错不需要告警工具,改请求重发即可。
+    """
+    def fake_run(message: str):
+        raise ToolInputError("bad argument")
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    assert result.run.status == "failed"
+    assert result.run.tool_result is None
+    assert result.run.error is not None
+    assert result.run.error.code == "TOOL_INPUT_ERROR"
+    assert result.run.error.message == "bad argument"
 
 
 def test_dispatch_internal_error(temp_agent_run_db):
-    """未预期异常 → 状态 internal_error,error.message 脱敏,不暴露原始异常信息。"""
+    """未预期异常 → status=failed + INTERNAL_ERROR,error.message 脱敏,不暴露原始异常信息。"""
     def fake_run(message: str):
         raise ValueError("secret details")
     _register_fake(fake_run)
 
     result = dispatch("fake", "hi")
 
-    assert result.run.status == "internal_error"
+    assert result.run.status == "failed"
     assert result.run.tool_result is None
     assert result.run.error is not None
     assert result.run.error.code == "INTERNAL_ERROR"
@@ -88,7 +110,8 @@ def test_dispatch_internal_error(temp_agent_run_db):
 def test_dispatch_tool_not_found(temp_agent_run_db):
     result = dispatch("missing", "hi")
 
-    assert result.run.status == "tool_not_found"
+    # 工具不存在也是 failed,error.code 区分具体原因
+    assert result.run.status == "failed"
     assert result.run.tool_result is None
     assert result.run.error is not None
     assert result.run.error.code == "TOOL_NOT_FOUND"
@@ -111,7 +134,7 @@ def test_dispatch_tool_args_and_timestamps(temp_agent_run_db):
     assert started < finished
 
 
-# ---------- 3. 4 个 status 都要落库(覆盖 success / tool_error / internal_error / tool_not_found) ----------
+# ---------- 3. 4 类业务结果都要落库 ----------
 
 
 def test_dispatch_success_persists_to_store(temp_agent_run_db):
@@ -123,9 +146,10 @@ def test_dispatch_success_persists_to_store(temp_agent_run_db):
 
     loaded = get_run(result.run.run_id, temp_agent_run_db)
     assert loaded is not None
-    assert loaded["status"] == "success"
+    assert loaded["status"] == "completed"
     assert loaded["tool_result"] == {"echo": "hi"}
     assert loaded["error"] is None
+    assert loaded["warnings"] == []
     assert loaded["tool_args"] == {"message": "hi"}
     assert loaded["input"] == "hi"
     assert loaded["selected_tool"] == "fake"
@@ -133,16 +157,32 @@ def test_dispatch_success_persists_to_store(temp_agent_run_db):
 
 def test_dispatch_tool_error_persists_to_store(temp_agent_run_db):
     def fake_run(message: str):
-        raise ToolExecutionError("bad input")
+        raise ToolExecutionError("internal tool bug")
     _register_fake(fake_run)
 
     result = dispatch("fake", "hi")
 
     loaded = get_run(result.run.run_id, temp_agent_run_db)
     assert loaded is not None
-    assert loaded["status"] == "tool_error"
+    assert loaded["status"] == "failed"
     assert loaded["tool_result"] is None
     assert loaded["error"]["code"] == "TOOL_EXECUTION_ERROR"
+    assert loaded["error"]["message"] == "internal tool bug"
+
+
+def test_dispatch_tool_input_error_persists_to_store(temp_agent_run_db):
+    """用户输入错 → DB 落 status=failed + error.code=TOOL_INPUT_ERROR。"""
+    def fake_run(message: str):
+        raise ToolInputError("bad input")
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    loaded = get_run(result.run.run_id, temp_agent_run_db)
+    assert loaded is not None
+    assert loaded["status"] == "failed"
+    assert loaded["tool_result"] is None
+    assert loaded["error"]["code"] == "TOOL_INPUT_ERROR"
     assert loaded["error"]["message"] == "bad input"
 
 
@@ -156,7 +196,7 @@ def test_dispatch_internal_error_persists_to_store(temp_agent_run_db):
 
     loaded = get_run(result.run.run_id, temp_agent_run_db)
     assert loaded is not None
-    assert loaded["status"] == "internal_error"
+    assert loaded["status"] == "failed"
     assert loaded["tool_result"] is None
     assert loaded["error"]["code"] == "INTERNAL_ERROR"
     assert loaded["error"]["message"] == "internal server error"
@@ -168,18 +208,19 @@ def test_dispatch_tool_not_found_persists_to_store(temp_agent_run_db):
 
     loaded = get_run(result.run.run_id, temp_agent_run_db)
     assert loaded is not None
-    assert loaded["status"] == "tool_not_found"
+    assert loaded["status"] == "failed"
     assert loaded["error"]["code"] == "TOOL_NOT_FOUND"
     assert loaded["tool_result"] is None
 
 
-# ---------- 4. 不可序列化 tool_result 仍能落库 ----------
+# ---------- 4. 不可序列化 tool_result 仍能落库 + 加 warning ----------
 
 
 def test_dispatch_unserializable_tool_result_still_persists(temp_agent_run_db):
-    """工具返回 set/自定义对象等不可 JSON 序列化的值,trace 仍要落库,
-    并且读出来的 tool_result 是结构化 fallback(带 _unserializable 标记)。
-    关键:不再静默退化为 None。
+    """工具返回 set 等不可 JSON 序列化的值:
+    1. trace 仍要落库
+    2. tool_result 是结构化 fallback(带 _serialization 标记)
+    3. warnings 列表里有 TOOL_RESULT_SERIALIZATION_FALLBACK caveat
     """
     def fake_run(message: str):
         return {1, 2, 3}  # set
@@ -187,27 +228,49 @@ def test_dispatch_unserializable_tool_result_still_persists(temp_agent_run_db):
 
     result = dispatch("fake", "hi")
 
-    # 业务结果(status=success)不受影响
-    assert result.run.status == "success"
+    # 业务结果(status=completed)不受影响
+    assert result.run.status == "completed"
     # AgentRun 内存里的 tool_result 仍然是原始 set(主调用方拿得到)
     assert result.run.tool_result == {1, 2, 3}
+    # warnings 列表里有 caveat
+    assert len(result.run.warnings) == 1
+    assert result.run.warnings[0].code == "TOOL_RESULT_SERIALIZATION_FALLBACK"
 
     # trace 仍然落库
     loaded = get_run(result.run.run_id, temp_agent_run_db)
     assert loaded is not None
-    assert loaded["status"] == "success"
+    assert loaded["status"] == "completed"
     # 落库后是结构化 fallback dict,不是 None
     assert loaded["tool_result"] is not None
-    assert loaded["tool_result"]["_unserializable"] is True
+    assert loaded["tool_result"]["_serialization"] == "fallback"
     assert loaded["tool_result"]["type"] == "set"
+    # warnings 也落库
+    assert len(loaded["warnings"]) == 1
+    assert loaded["warnings"][0]["code"] == "TOOL_RESULT_SERIALIZATION_FALLBACK"
 
 
-# ---------- 5. 持久化失败时,调用方能拿到明确失败信息 ----------
+def test_dispatch_serializable_tool_result_has_no_warnings(temp_agent_run_db):
+    """正常返回值的 run 不会有 warning。"""
+    def fake_run(message: str):
+        return {"echo": message}
+    _register_fake(fake_run)
+
+    result = dispatch("fake", "hi")
+
+    assert result.run.warnings == []
+    loaded = get_run(result.run.run_id, temp_agent_run_db)
+    assert loaded["warnings"] == []
+
+
+# ---------- 5. 持久化失败时,业务结果保留 + status 盖成 trace_persist_failed ----------
 
 
 def test_dispatch_surfaces_persistence_failure(monkeypatch, tmp_path):
-    """insert_run 抛异常(模拟 DB 锁 / 磁盘满 / 权限错),
-    dispatch 不应再静默吞错,要在 run 上带出 trace_persistence=failed + trace_error。"""
+    """insert_run 抛异常(模拟 DB 锁 / 磁盘满 / 权限错):
+    - status 盖成 trace_persist_failed
+    - error.code = TRACE_PERSIST_FAILED
+    - 业务结果保留(主调用方拿得到)
+    """
     db = tmp_path / "runs.db"
     init_db(db)
     monkeypatch.setattr("app.agent_run_store._db_path", db)
@@ -222,13 +285,12 @@ def test_dispatch_surfaces_persistence_failure(monkeypatch, tmp_path):
 
     result = dispatch("fake", "hi")
 
-    # 业务结果仍然返回,不让 trace 失败反过来影响业务可观察性
-    assert result.run.status == "success"
+    # 业务结果仍然在响应里
     assert result.run.tool_result == {"ok": True}
-    # 持久化失败被显式带出来
-    assert result.run.trace_persistence == "failed"
-    assert result.run.trace_error is not None
-    assert "RuntimeError" in result.run.trace_error
-    assert "disk full" in result.run.trace_error
-    # 业务 error 字段不该被污染(这是 trace 失败,不是业务失败)
-    assert result.run.error is None
+    # status 盖成 trace_persist_failed(只 in-memory,DB 没这行)
+    assert result.run.status == "trace_persist_failed"
+    # error.code 显式带出失败原因
+    assert result.run.error is not None
+    assert result.run.error.code == "TRACE_PERSIST_FAILED"
+    assert "RuntimeError" in result.run.error.message
+    assert "disk full" in result.run.error.message

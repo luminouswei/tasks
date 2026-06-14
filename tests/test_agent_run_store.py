@@ -220,11 +220,11 @@ def test_safe_serialize_handles_unserializable_values():
     from app.agent_run_store import safe_serialize_tool_result
 
     fallback_set = json.loads(safe_serialize_tool_result({1, 2, 3}))
-    assert fallback_set["_unserializable"] is True
+    assert fallback_set["_serialization"] == "fallback"
     assert fallback_set["type"] == "set"
 
     fallback_bytes = json.loads(safe_serialize_tool_result(b"binary"))
-    assert fallback_bytes["_unserializable"] is True
+    assert fallback_bytes["_serialization"] == "fallback"
     assert fallback_bytes["type"] == "bytes"
     assert "binary" in fallback_bytes["repr"]
 
@@ -233,7 +233,7 @@ def test_safe_serialize_handles_unserializable_values():
             return "<Secret: leaked-detail>"
 
     fallback_obj = json.loads(safe_serialize_tool_result(Secret()))
-    assert fallback_obj["_unserializable"] is True
+    assert fallback_obj["_serialization"] == "fallback"
     assert fallback_obj["type"] == "Secret"
     assert "<Secret" in fallback_obj["repr"]
 
@@ -249,7 +249,7 @@ def test_safe_serialize_truncates_oversized_repr():
             return "x" * 5000
 
     fallback = json.loads(safe_serialize_tool_result(Chatty()))
-    assert fallback["_unserializable"] is True
+    assert fallback["_serialization"] == "fallback"
     assert len(fallback["repr"]) == 500  # 截断上限
 
 
@@ -266,9 +266,9 @@ def test_unserializable_tool_result_round_trips_through_store(tmp_path):
     loaded = get_run(record["run_id"], db)
 
     assert loaded is not None
-    # 关键:不再静默退化为 None,而是带 _unserializable 标记的 dict
+    # 关键:不再静默退化为 None,而是带 _serialization 标记的 dict
     assert loaded["tool_result"] is not None
-    assert loaded["tool_result"]["_unserializable"] is True
+    assert loaded["tool_result"]["_serialization"] == "fallback"
     assert loaded["tool_result"]["type"] == "set"
 
 
@@ -291,7 +291,46 @@ def test_unserializable_tool_args_round_trips_through_store(tmp_path):
     # 关键:整条 trace 落库成功,没因为 tool_args 里有 set 而整条丢
     assert loaded is not None
     # 整个 tool_args 走 fallback
-    assert loaded["tool_args"]["_unserializable"] is True
+    assert loaded["tool_args"]["_serialization"] == "fallback"
     assert loaded["tool_args"]["type"] == "dict"
     # repr 里能看到原 dict 的关键信息(用于调试)
     assert "message" in loaded["tool_args"]["repr"]
+
+
+# ---------- warnings 字段的序列化 / 反序列化 ----------
+
+
+def test_warnings_round_trips_through_store(tmp_path):
+    """warnings: list[AgentWarning] 落库后能反序列化回来。"""
+    from app.agent_run import AgentWarning
+
+    db = tmp_path / "runs.db"
+    init_db(db)
+    record = _base_record(
+        run_id="f" * 32,
+        warnings=[AgentWarning(
+            code="TOOL_RESULT_SERIALIZATION_FALLBACK",
+            message="tool result was converted to safe repr",
+        )],
+    )
+    insert_run(record, db)
+
+    loaded = get_run(record["run_id"], db)
+
+    assert loaded is not None
+    assert loaded["warnings"] == [
+        {"code": "TOOL_RESULT_SERIALIZATION_FALLBACK",
+         "message": "tool result was converted to safe repr"},
+    ]
+
+
+def test_empty_warnings_does_not_occupy_column(tmp_path):
+    """空 warnings 列表:DB 里这一列为 None,读出来是 []。"""
+    db = tmp_path / "runs.db"
+    init_db(db)
+    record = _base_record(run_id="1" * 32, warnings=[])
+    insert_run(record, db)
+
+    loaded = get_run(record["run_id"], db)
+
+    assert loaded["warnings"] == []

@@ -1,17 +1,35 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
-# 跟 app/errors.py 的几个 code 一一对应,作为 status 字段的字面量约束。
-RunStatus = Literal[
-    "success",
-    "tool_not_found",
-    "tool_error",
-    "internal_error",
-]
+# status 描述"这次 run 在工程链路里走到哪一步",不是业务结果。
+# 3 值:
+# - "completed"        业务执行成功 + trace 落库成功(写入 DB)
+# - "failed"           业务执行失败 + trace 落库成功(写入 DB;error.code 描述原因)
+# - "trace_persist_failed"  业务无论成败,trace 落库失败;
+#                           **只放 API response / log,DB 里不保证有对应行**
+#
+# DB 里只存 completed / failed 两个值,trace_persist_failed 是 dispatcher
+# 在 insert_run 抛异常时临时盖在 in-memory AgentRun 对象上的标志,用于翻译响应。
+# 客户端看 DB 行永远不会看到 trace_persist_failed。
+RunStatus = Literal["completed", "failed", "trace_persist_failed"]
 
 
 @dataclass
 class AgentErrorPayload:
+    code: str
+    message: str
+
+
+@dataclass
+class AgentWarning:
+    """非致命的降级事件。run 业务上成功了(没 error),但有 caveat 需要客户端知道。
+
+    跟 error 区分:
+    - error:   run 失败,error.code 解释原因
+    - warning: run 成功(没 error),warning.code 解释降级/caveat
+
+    告警/分桶时不要混,WHERE error.code IS NOT NULL 不能把带 warning 的 run 算成失败。
+    """
     code: str
     message: str
 
@@ -27,8 +45,6 @@ class AgentRun:
     error: AgentErrorPayload | None
     started_at: str
     finished_at: str
-    # trace_persistence 描述"业务执行成功后,trace 是否成功落库"。
-    # "ok" = insert_run 成功;"failed" = 抛了异常(dispatcher 仍把业务结果带回来,主调用方拿得到)。
-    # 跟 status 字段正交:status 描述业务结果(成功/失败),trace_persistence 描述可观测性落库结果。
-    trace_persistence: Literal["ok", "failed"] = "ok"
-    trace_error: str | None = None
+    # warnings: 非致命降级事件列表。常见来源:
+    # - TOOL_RESULT_SERIALIZATION_FALLBACK: tool_result 不可 JSON 序列化,已走 fallback
+    warnings: list[AgentWarning] = field(default_factory=list)

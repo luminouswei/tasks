@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from app.errors import ToolExecutionError
+from app.errors import ToolInputError
 
 
 @dataclass
@@ -33,12 +33,12 @@ def tokenize(expr: str) -> list[Token]:
             raw_number = expr[start:i]
 
             if dot_count > 1 or raw_number == ".":
-                raise ToolExecutionError(f"parse error: invalid number '{raw_number}'")
+                raise ToolInputError(f"parse error: invalid number '{raw_number}'")
 
             try:
                 value = float(raw_number)
             except ValueError:
-                raise ToolExecutionError(f"parse error: invalid number '{raw_number}'")
+                raise ToolInputError(f"parse error: invalid number '{raw_number}'")
 
             tokens.append(Token("NUMBER", value))
             continue
@@ -56,7 +56,7 @@ def tokenize(expr: str) -> list[Token]:
         elif char == ")":
             tokens.append(Token("RPAREN"))
         else:
-            raise ToolExecutionError(f"parse error: invalid character '{char}'")
+            raise ToolInputError(f"parse error: invalid character '{char}'")
 
         i += 1
 
@@ -76,7 +76,7 @@ class Parser:
     def advance(self) -> Token:
         token = self.current()
         if token is None:
-            raise ToolExecutionError("parse error: unexpected end of expression")
+            raise ToolInputError("parse error: unexpected end of expression")
 
         self.pos += 1
         return token
@@ -115,7 +115,7 @@ class Parser:
             elif self.match("SLASH"):
                 divisor = self.factor()
                 if divisor == 0:
-                    raise ToolExecutionError("division by zero")
+                    raise ToolInputError("division by zero")
                 result /= divisor
             else:
                 break
@@ -127,39 +127,39 @@ class Parser:
             return -self.factor()
 
         if self.match("PLUS"):
-            raise ToolExecutionError("parse error: unexpected '+'")
+            raise ToolInputError("parse error: unexpected '+'")
 
         token = self.current()
 
         if token is None:
-            raise ToolExecutionError("parse error: unexpected end of expression")
+            raise ToolInputError("parse error: unexpected end of expression")
 
         if token.type == "NUMBER":
             self.advance()
             if token.value is None:
-                raise ToolExecutionError("parse error: invalid number token")
+                raise ToolInputError("parse error: invalid number token")
             return token.value
 
         if self.match("LPAREN"):
             result = self.expression()
 
             if not self.match("RPAREN"):
-                raise ToolExecutionError("parse error: missing ')'")
+                raise ToolInputError("parse error: missing ')'")
 
             return result
 
-        raise ToolExecutionError(f"parse error: unexpected token '{token.type}'")
+        raise ToolInputError(f"parse error: unexpected token '{token.type}'")
 
 
 def parse(tokens: list[Token]) -> float:
     if not tokens:
-        raise ToolExecutionError("parse error: empty expression")
+        raise ToolInputError("parse error: empty expression")
 
     parser = Parser(tokens)
     result = parser.expression()
 
     if parser.current() is not None:
-        raise ToolExecutionError("parse error: unexpected token after expression")
+        raise ToolInputError("parse error: unexpected token after expression")
 
     return result
 
