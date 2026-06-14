@@ -1,11 +1,18 @@
 """Agent diagnostics 回归评测套件。
 
 这套测试不是单点 unit test,而是把"跑一次 agent → 落库 → 取 diagnostics"
-这条端到端路径当作一个整体,断言关键不变量稳定。目标:
+这条端到端路径当作一个整体,断言关键不变量稳定。覆盖链路:
+
+  dispatch → store → diagnostics(纯函数) → API(HTTP 响应 shaping)
+
+目标:
 
   1. 正常工具调用成功 → status=completed + 完整 7 事件 timeline + 可读 summary。
   2. 工具执行失败 → 分类成 tool_error + 失败信息保留 + timeline 含 tool_failed。
   3. 非 JSON 可序列化结果 → 走 fallback + 警告 + serialization_error 分类。
+  4. 持久化失败边界 → 业务结果保留 + status=trace_persist_failed + DB 查不到。
+  5. HTTP API smoke → 走 POST /agent/run + GET /agent/runs/{id}/diagnostics,
+     验证 7 字段契约在 HTTP response shaping 后不破。
 
 跟已有 test_api_diagnostics.py / test_dispatcher.py 的区别:
   - 已有测试是单点契约(每个文件盯一个函数或一个端点)。
@@ -28,7 +35,7 @@ from app.diagnostics import (
     classify_failure_type,
 )
 from app.dispatcher import dispatch
-from app.errors import ToolExecutionError, ToolInputError
+from app.errors import ToolExecutionError
 from app.registry import ToolSpec
 
 
@@ -73,7 +80,7 @@ SUCCESS_TIMELINE = [
 #          test_api_diagnostics.test_diagnostics_success_run_has_complete_timeline
 # ============================================================
 
-def test_regression_case_1_happy_path_tool_call(temp_agent_run_db, capsys):
+def test_regression_case_1_happy_path_tool_call(temp_agent_run_db):
     """happy path: 结构化 dict 返回值,从 dispatch → store → diagnostics 一条龙。"""
     input_message = "hi"
     tool_name = "fake"
@@ -139,7 +146,7 @@ def test_regression_case_1_happy_path_tool_call(temp_agent_run_db, capsys):
 #          test_api_diagnostics.test_diagnostics_tool_execution_error_classified_as_tool_error
 # ============================================================
 
-def test_regression_case_2_tool_execution_failure(temp_agent_run_db, capsys):
+def test_regression_case_2_tool_execution_failure(temp_agent_run_db):
     """tool failure: 工具主动抛 ToolExecutionError(工具责任,500)。
 
     跨层保护: failure_type=tool_error 稳定分类 + 失败原因不丢 + timeline
@@ -217,7 +224,7 @@ def test_regression_case_2_tool_execution_failure(temp_agent_run_db, capsys):
 #          test_api_diagnostics.test_diagnostics_unserializable_classified_as_serialization_error
 # ============================================================
 
-def test_regression_case_3_unserializable_tool_result(temp_agent_run_db, capsys):
+def test_regression_case_3_unserializable_tool_result(temp_agent_run_db):
     """序列化 fallback: 工具返回 set(JSON 不可序列化)。
 
     跨层保护: 业务成功不丢诊断 — status 仍是 completed,但 diagnostics
@@ -304,7 +311,7 @@ def test_regression_case_3_unserializable_tool_result(temp_agent_run_db, capsys)
 #   参照: test_dispatcher.test_dispatch_surfaces_persistence_failure
 # ============================================================
 
-def test_regression_case_4_persistence_failure_boundary(temp_agent_run_db, monkeypatch, capsys):
+def test_regression_case_4_persistence_failure_boundary(temp_agent_run_db, monkeypatch):
     """持久化失败边界: insert_run 抛 RuntimeError(模拟磁盘满 / DB 锁)。
 
     跨层保护: 业务结果保留 + status 盖成 trace_persist_failed + timeline
@@ -367,6 +374,78 @@ def test_regression_case_4_persistence_failure_boundary(temp_agent_run_db, monke
         f"[case_4] persistence failure boundary: PASS "
         f"failure_type={diag.failure_type} tool_result_preserved=True"
     )
+
+
+# ============================================================
+# 用例 5: HTTP API smoke — 走完整 HTTP 链路
+#   风险: dispatch / store / diagnostics 都在内部测试了,但 HTTP response
+#         shaping(7 字段契约序列化 + 状态码)这条链没人盯。
+#         一旦 main.py 里 _diagnostics_to_response 改了字段名 / 顺序 / 类型,
+#         客户端 JSON 解析会破,但纯函数测试不会红。
+#   参照: test_api_diagnostics.test_diagnostics_response_has_7_keys
+#          test_api_diagnostics.test_diagnostics_success_run_has_complete_timeline
+# ============================================================
+
+def test_regression_case_5_api_smoke_via_http(client):
+    """HTTP smoke: 走 POST /agent/run → GET /agent/runs/{id}/diagnostics 一条龙。
+
+    跟 case_1 的区别:
+      - case_1 直接调 build_diagnostics()(纯函数层断言)。
+      - case_5 走 HTTP(TestClient 模拟真实请求),盯 response shaping
+        (7 字段契约 + HTTP 200 + 摘要文本在 JSON 里完好)。
+
+    两层各自独立断言:任一层破了,各自的用例会先红。
+    """
+    tool_name = "fake_http"
+    input_message = "hi"
+
+    def fake_tool(message: str):
+        return {"echo": message}
+
+    _register(tool_name, fake_tool)
+
+    # ── POST /agent/run ───────────────────────────────────────────
+    post = client.post(
+        "/agent/run",
+        json={"tool": tool_name, "message": input_message},
+    )
+    assert post.status_code == 200, f"POST failed: {post.status_code} {post.text}"
+    run_id = post.json()["run_id"]
+    assert re.fullmatch(r"[0-9a-f]{32}", run_id)
+
+    # ── GET /agent/runs/{id}/diagnostics ─────────────────────────
+    diag_resp = client.get(f"/agent/runs/{run_id}/diagnostics")
+    assert diag_resp.status_code == 200, f"GET failed: {diag_resp.status_code} {diag_resp.text}"
+    body = diag_resp.json()
+
+    # 7 字段契约必须全在,客户端解析逻辑依赖这个
+    DIAGNOSTICS_KEYS = (
+        "run_id", "status", "failure_type", "failure_message",
+        "timeline", "diagnostic_summary", "suggested_action",
+    )
+    for key in DIAGNOSTICS_KEYS:
+        assert key in body, f"missing key: {key}"
+
+    assert body["run_id"] == run_id
+    assert body["status"] == "completed"
+    assert body["failure_type"] is None
+    assert body["failure_message"] is None
+    assert body["suggested_action"] is None
+
+    # timeline 通过 HTTP 后顺序仍然对齐 7 事件常量
+    assert [ev["name"] for ev in body["timeline"]] == SUCCESS_TIMELINE
+
+    # summary 在 JSON 里完好,运维一眼看到工具名 + 状态
+    assert tool_name in body["diagnostic_summary"]
+    assert "completed" in body["diagnostic_summary"].lower()
+
+    # ── 负样本: 不存在的 run_id 走 404 RUN_NOT_FOUND ─────────────
+    not_found = client.get("/agent/runs/00000000000000000000000000000000/diagnostics")
+    assert not_found.status_code == 404
+    # 404 响应里 code 嵌在 error 子对象里(看 main.py:_not_found_response)
+    assert not_found.json()["error"]["code"] == "RUN_NOT_FOUND"
+
+    print(f"[case_5] api smoke via http: PASS run_id={run_id}")
 
 
 # ============================================================
